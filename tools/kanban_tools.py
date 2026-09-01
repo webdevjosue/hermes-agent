@@ -361,33 +361,160 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
-def heartbeat_current_worker_from_env() -> bool:
-    """Best-effort: extend the kanban claim + bump board heartbeat for the
-    current dispatcher-spawned worker, using identity from env vars.
+def _now_monotonic() -> float:
+    """Indirection for tests (monkeypatch ``tools.kanban_tools._now_monotonic``)."""
+    import time as _time
 
-    Returns True if a write was attempted (whether or not it succeeded);
-    False if the call was skipped (not a kanban worker, rate-limited, or
-    swallowed exception). The boolean is informational — callers should
-    not branch on it.
+    return _time.monotonic()
 
-    Identity comes from:
-      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
-      * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
-        a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
 
-    Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
-    timestamp (monotonic clock); not thread-safe in the strict sense, but
-    the worst case is one extra DB write per race, which is harmless.
+# Progress-gating state (run-244 wedge, t_3df0dd33): the bridge used to bump
+# the board heartbeat on EVERY activity tick, so 217 passive stream/wait
+# heartbeats masked a 4-hour stall from ``detect_stale_running``. The board
+# heartbeat write now fires only on PROGRESS: a new tool name, a new
+# normalized-args signature (volatile wait-shaping numerics like ``timeout``
+# dropped, reusing ``RepetitionWatchdogState.signature`` — its static
+# normalizer only, never the shared unguarded streak state per the
+# t_5b9c8c40 review caveat), changed non-empty assistant text, the explicit
+# ``kanban_heartbeat`` tool, or an activity stamp carrying the
+# ``AGENT_PROGRESS`` provenance. The claim-TTL half (``heartbeat_claim``)
+# stays progress-UNgated: a healthy worker inside one long tool call must
+# keep its claim alive (the #23025 trap the bridge originally fixed).
+_progress_last_tool_sig: Optional[str] = None
+_progress_last_text_hash: Optional[str] = None
+
+
+def _reset_progress_gate_state() -> None:
+    """Test hook: clear the module-level progress-signature trackers."""
+    global _progress_last_tool_sig, _progress_last_text_hash
+    _progress_last_tool_sig = None
+    _progress_last_text_hash = None
+
+
+def _tool_call_signature(tool_name: str, args: Optional[dict]) -> Optional[str]:
+    """Normalized signature of a tool call for progress comparison.
+
+    Reuses the repetition watchdog's static normalizer (volatile arg keys
+    dropped) so the exact run-244 drift (timeout 170->175->178 across 76
+    identical polls) is NOT progress while a genuinely different call is.
+    Static + lock-free; the watchdog's shared streak state is not touched.
     """
-    global _auto_heartbeat_last_attempt
+    try:
+        from agent.tool_call_repetition_watchdog import RepetitionWatchdogState
+
+        return RepetitionWatchdogState.signature(tool_name, args)
+    except Exception:
+        return None
+
+
+def _text_signature(desc: Optional[str]) -> Optional[str]:
+    """Hash of a non-empty assistant text for change detection."""
+    import hashlib as _hashlib
+
+    text = (desc or "").strip()
+    if not text:
+        return None
+    return _hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def mark_board_progress(
+    *,
+    kind: str,
+    desc: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    args: Optional[dict] = None,
+    provenance=None,
+) -> bool:
+    """Gated runtime-activity -> board-heartbeat bridge entry point.
+
+    Classifies a progress report and, when it represents REAL progress (or
+    when enough passive time has accumulated to keep the claim TTL alive),
+    performs the same best-effort board writes the old bridge did:
+
+    - ``heartbeat_claim`` — ALWAYS attempted on every eligible tick
+      (rate-limited 60s) regardless of progress, so a live worker inside
+      one long tool call is never reclaimed by ``release_stale_claims``.
+    - ``heartbeat_worker(progress=...)`` — attempted ONLY on progress
+      signals. ``progress=True`` writes also stamp the board's durable
+      ``last_progress_at`` so the dispatcher's progress watchdog
+      (``detect_progress_stalled``) can see the difference between
+      "heartbeat alive" and "actually making progress".
+
+    Kinds:
+
+    - ``"tool"``: a dispatched tool call (name + normalized args). Progress
+      when the signature differs from the last observed one.
+    - ``"text"``: assistant text; progress when non-empty and changed.
+    - ``"explicit"``: the explicit ``kanban_heartbeat`` tool — always
+      progress (model intent).
+    - ``"activity"``: a passive activity stamp; progress ONLY when it
+      carries ``provenance=ActivityProvenance.AGENT_PROGRESS``.
+
+    Returns True when a progress write was attempted; False when the gate
+    suppressed it. Never raises (fail-open, same contract as the bridge).
+    """
+    global _auto_heartbeat_last_attempt, _progress_last_tool_sig, _progress_last_text_hash
+
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
-    import time as _time
-    now = _time.monotonic()
+
+    is_progress = False
+    if kind == "explicit":
+        is_progress = True
+    elif kind == "tool":
+        sig = _tool_call_signature(tool_name or "", args)
+        if sig is not None:
+            if sig != _progress_last_tool_sig:
+                is_progress = True
+            # Advance the tracker even when the write is rate-limited so a
+            # later identical re-issue after the window is still recognized
+            # as not-progress (run-244 poll-loop shape).
+            _progress_last_tool_sig = sig
+        else:
+            # Normalizer unavailable (import failure): fail-open as progress.
+            is_progress = True
+    elif kind == "text":
+        text_hash = _text_signature(desc)
+        if text_hash is not None and text_hash != _progress_last_text_hash:
+            is_progress = True
+            _progress_last_text_hash = text_hash
+    elif kind == "activity":
+        try:
+            from agent.session_activity import ActivityProvenance
+
+            if provenance is ActivityProvenance.AGENT_PROGRESS:
+                is_progress = True
+        except Exception:
+            pass
+
+    if not is_progress:
+        # Not progress, but time may still have elapsed past the rate window:
+        # refresh the claim TTL only (the #23025 protection), never the board
+        # heartbeat.
+        now = _now_monotonic()
+        if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return False
+        _auto_heartbeat_last_attempt = now
+        try:
+            kb, conn = _connect()
+            try:
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                try:
+                    kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+                except Exception:
+                    logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        return False
+
+    # Progress: rate-limited combined write (claim + board heartbeat).
+    now = _now_monotonic()
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
     _auto_heartbeat_last_attempt = now
@@ -406,7 +533,9 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id, progress=True
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -418,6 +547,56 @@ def heartbeat_current_worker_from_env() -> bool:
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
         return False
+
+
+def heartbeat_current_worker_from_env(
+    *,
+    provenance=None,
+    tool_name: Optional[str] = None,
+    args: Optional[dict] = None,
+    desc: Optional[str] = None,
+    explicit: bool = False,
+) -> bool:
+    """Best-effort: extend the kanban claim + bump board heartbeat for the
+    current dispatcher-spawned worker, using identity from env vars.
+
+    PROGRESS-GATED (run-244 wedge, t_3df0dd33): the board heartbeat half
+    only fires on real progress (see ``mark_board_progress``); passive
+    stream/wait activity ticks refresh the claim TTL only, so a wedged
+    worker emitting bare identical tool calls every ~3min no longer looks
+    alive to ``detect_stale_running`` / ``detect_progress_stalled``.
+
+    Returns True if a progress write was attempted (whether or not it
+    succeeded); False if the call was skipped (not a kanban worker,
+    rate-limited, gate-suppressed, or swallowed exception). The boolean is
+    informational — callers should not branch on it.
+
+    Identity comes from:
+      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
+      * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
+        a stale run that may have already been reclaimed
+      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
+        falls back to the default ``_claimer_id()`` for locally-driven
+        workers that never went through the dispatcher path
+
+    Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
+    timestamp (monotonic clock); not thread-safe in the strict sense, but
+    the worst case is one extra DB write per race, which is harmless.
+    """
+    if explicit:
+        return mark_board_progress(kind="explicit")
+    if tool_name is not None:
+        return mark_board_progress(kind="tool", tool_name=tool_name, args=args)
+    if desc is not None:
+        # Wait notices / stream ticks arrive as bare descriptions; only
+        # texts explicitly marked as assistant output count as progress
+        # via the provenance gate below. Treat desc-only calls as passive
+        # activity unless the caller passed AGENT_PROGRESS.
+        from agent.session_activity import normalize_activity_provenance
+
+        prov = normalize_activity_provenance(provenance)
+        return mark_board_progress(kind="activity", desc=desc, provenance=prov)
+    return mark_board_progress(kind="activity", provenance=provenance)
 
 
 # Live operator-note injection: poll the worker's task for new comments and
@@ -1129,6 +1308,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                progress=True,
             )
             if not ok:
                 return tool_error(
