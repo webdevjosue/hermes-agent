@@ -68,6 +68,11 @@ from agent.codex_headers import (
     codex_cloudflare_headers as _codex_cloudflare_headers,
     is_official_codex_base_url as _is_official_codex_base_url,
 )
+from agent.retry_utils import (
+    ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET as _ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET,
+    is_zai_coding_transient_auth_error as _is_zai_coding_transient_auth_error,
+    zai_coding_transient_auth_backoff as _zai_coding_transient_auth_backoff_default,
+)
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
@@ -5191,6 +5196,45 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
             _evict_cached_clients(normalized)
             return True
     return False
+
+
+def _zai_transient_auth_backoff(retry_number: int) -> float:
+    """Test-patchable indirection over retry_utils' backoff (keeps the
+    production default while allowing tests to zero out the ~30s/~60s
+    waits)."""
+    return _zai_coding_transient_auth_backoff_default(retry_number)
+
+
+def _zai_transient_auth_retry_due(
+    first_err: BaseException,
+    *,
+    task: Optional[str],
+    resolved_provider: Optional[str],
+    client: Any,
+    _base_info: Any,
+    final_model: Optional[str],
+) -> bool:
+    """True when first_err is the scoped Z.AI Coding transient 401/1000.
+
+    Production shape (2026-08-31/09-01 fleet incident, cards t_340a8a3f +
+    t_832d0510): the Coding Plan endpoint intermittently returns HTTP 401
+    body code 1000 "Authentication Failed" / "身份验证失败。" under
+    concurrent load while the SAME key succeeds seconds later in the same
+    session. The main conversation loop already rides these out with a
+    bounded same-provider retry; auxiliary tasks (vision_analyze etc.) had
+    no such retry — with an explicit aux provider (auxiliary.vision.provider:
+    zai) the 401 is auth-not-capacity, the fallback gate stays shut, and the
+    tool dies in <1s. Scoped identically to is_zai_coding_transient_auth_error
+    so ordinary 401s on every other provider/model keep failing fast.
+    """
+    if not _is_auth_error(first_err):
+        return False
+    base_url = str(getattr(client, "base_url", "") or _base_info or "")
+    return _is_zai_coding_transient_auth_error(
+        base_url=base_url,
+        model=final_model or "",
+        error=first_err,
+    )
 
 
 def _retry_same_provider_sync(
@@ -10824,6 +10868,50 @@ def _call_llm_impl(
                         api_mode=resolved_api_mode,
                     ), task)
 
+        # ── Z.AI Coding transient 401/1000: bounded same-provider retry ──
+        # (fleet incident 2026-08-31/09-01, card t_832d0510) The Coding Plan
+        # endpoint intermittently 401s with body code 1000 under concurrent
+        # load while the SAME key succeeds seconds later — the main
+        # conversation loop rides this out (t_340a8a3f) but auxiliary tasks
+        # had no equivalent, so vision_analyze died in <1s. Spend a small
+        # bounded budget (~30s/~60s waits) retrying the SAME provider BEFORE
+        # the auth-refresh / pool-rotation / fallback rungs; a genuinely
+        # dead key exhausts the budget and falls through to them unchanged.
+        _zai_auth_retries = 0
+        while (
+            _zai_transient_auth_retry_due(
+                first_err,
+                task=task,
+                resolved_provider=resolved_provider,
+                client=client,
+                _base_info=_base_info,
+                final_model=final_model,
+            )
+            and _zai_auth_retries < _ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET
+        ):
+            _zai_auth_retries += 1
+            _zai_wait = _zai_transient_auth_backoff(_zai_auth_retries)
+            logger.warning(
+                "Auxiliary %s: Z.AI Coding transient 401/1000 — same-provider retry %d/%d after %.0fs",
+                task or "call", _zai_auth_retries, _ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET, _zai_wait,
+            )
+            if _zai_wait > 0:
+                time.sleep(_zai_wait)
+            try:
+                return _validate_llm_response(
+                    _relay_sync_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
+            except Exception as retry_err:
+                first_err = retry_err
+                if not _is_auth_error(retry_err):
+                    # Different failure on the retry: re-enter the chain
+                    # below for whatever it is (payment/conn/ratelimit/…).
+                    break
+
         # ── Auth refresh retry ───────────────────────────────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
             resolved_provider, _base_info)
@@ -11617,6 +11705,45 @@ async def _async_call_llm_impl(
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
                     ), task)
+
+        # ── Z.AI Coding transient 401/1000: bounded same-provider retry ──
+        # Mirrors the sync call_llm() rung (fleet incident card t_832d0510):
+        # scoped transient auth blips on the Coding Plan endpoint get a small
+        # bounded same-provider retry BEFORE the auth-refresh / pool /
+        # fallback rungs; a dead key exhausts it and falls through unchanged.
+        _zai_auth_retries = 0
+        while (
+            _zai_transient_auth_retry_due(
+                first_err,
+                task=task,
+                resolved_provider=resolved_provider,
+                client=client,
+                _base_info=_client_base,
+                final_model=final_model,
+            )
+            and _zai_auth_retries < _ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET
+        ):
+            _zai_auth_retries += 1
+            _zai_wait = _zai_transient_auth_backoff(_zai_auth_retries)
+            logger.warning(
+                "Auxiliary %s (async): Z.AI Coding transient 401/1000 — same-provider retry %d/%d after %.0fs",
+                task or "call", _zai_auth_retries, _ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET, _zai_wait,
+            )
+            if _zai_wait > 0:
+                import asyncio as _asyncio_mod
+                await _asyncio_mod.sleep(_zai_wait)
+            try:
+                return _validate_llm_response(
+                    await _relay_async_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
+            except Exception as retry_err:
+                first_err = retry_err
+                if not _is_auth_error(retry_err):
+                    break
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
