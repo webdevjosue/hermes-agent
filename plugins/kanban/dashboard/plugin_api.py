@@ -903,6 +903,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    # Dashboard PATCH is an explicit human action —
+                    # allowed to override a live worker claim (M1
+                    # mirror, run-263 guard).
+                    force=True,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -1347,6 +1351,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            # Bulk dashboard action: explicit human
+                            # override (run-263 guard).
+                            force=True,
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)

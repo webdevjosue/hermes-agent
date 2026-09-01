@@ -638,6 +638,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--force", action="store_true",
+                            help="Complete even while the task runs under another "
+                                 "worker\'s live claim (explicit operator override; "
+                                 "run-263 guard).")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2398,6 +2402,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                force=getattr(args, "force", False),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

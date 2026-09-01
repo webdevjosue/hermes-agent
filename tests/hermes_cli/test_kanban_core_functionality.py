@@ -492,7 +492,11 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
             assert task.current_run_id == runs[0].id
 
             # Subsequent complete closes the backfilled run cleanly.
-            kb.complete_task(conn2, tid, result="done", summary="ok")
+            # run-263 guard: prove ownership like a real worker.
+            kb.complete_task(
+                conn2, tid, result="done", summary="ok",
+                expected_run_id=kb.get_task(conn2, tid).current_run_id,
+            )
             r = kb.latest_run(conn2, tid)
             assert r.outcome == "completed"
             assert r.summary == "ok"
@@ -1147,6 +1151,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
                 conn, parent_a,
                 summary="oops",
                 created_cards=["t_phantomdeadbeef"],
+                expected_run_id=kb.get_task(conn, parent_a).current_run_id,
             )
         assert kb.get_task(conn, parent_a).status == "running"
 
@@ -1155,6 +1160,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             conn, parent_a,
             summary="retry without claims",
             created_cards=[],
+            expected_run_id=kb.get_task(conn, parent_a).current_run_id,
         )
         assert ok is True
         assert kb.get_task(conn, parent_a).status == "done"
@@ -1166,6 +1172,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
                 conn, parent_b,
                 summary="oops",
                 created_cards=[real, "t_anotherphantom"],
+                expected_run_id=kb.get_task(conn, parent_b).current_run_id,
             )
         assert kb.get_task(conn, parent_b).status == "running"
 
@@ -1173,6 +1180,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             conn, parent_b,
             summary="retry with corrected list",
             created_cards=[real],
+            expected_run_id=kb.get_task(conn, parent_b).current_run_id,
         )
         assert ok is True
         assert kb.get_task(conn, parent_b).status == "done"

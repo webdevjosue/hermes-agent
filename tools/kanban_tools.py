@@ -1027,6 +1027,23 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.ClaimOwnershipError as own_err:
+                # Structured rejection (run-263 incident, t_7f85aa6f): a
+                # non-owner (no HERMES_KANBAN_RUN_ID match) tried to
+                # complete a task running under someone else's live
+                # claim. Nothing was mutated — audit event already
+                # landed. Tell the caller how to proceed instead of
+                # crashing the run.
+                return tool_error(
+                    f"kanban_complete refused: {own_err}. Your task was "
+                    f"NOT completed and was NOT mutated — it is still "
+                    f"running under the owning worker's claim. Either: "
+                    f"(1) you are the spawned worker on another card — "
+                    f"do not complete cards you were not dispatched to; "
+                    f"(2) an operator wants to force-close it — use "
+                    f"`hermes kanban complete <task_id> --force` or the "
+                    f"dashboard 'done' action (explicit human override)."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
