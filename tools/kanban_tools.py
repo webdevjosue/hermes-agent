@@ -217,10 +217,13 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
 # audited done cards with the trace despite the LOOP-CLOSURE LAW text
 # shipping in every SOUL.md / system prompt — awareness alone does not
 # enforce behaviour, so the completion path hard-gates it.  Card
-# t_31b252aa.  Only the orchestrator profile is scoped for now; extend
-# this set as the weekly Fleet Loop Optimizer audit (Mon 09:00) widens
-# enforcement.
-_LOOP_TRACE_REQUIRED_PROFILES = frozenset({"default"})
+# t_31b252aa scoped this to the orchestrator; card t_a617051b adds
+# 'frontend' as pilot #2 after the 2026-09-01 Daily digest showed the
+# prompt-only profile at 2/7 trace compliance vs 3/3 for the gated
+# orchestrator.  Extend this set further only after each pilot shows
+# the same clean adoption (weekly Fleet Loop Optimizer audit,
+# Mon 09:00).
+_LOOP_TRACE_REQUIRED_PROFILES = frozenset({"default", "frontend"})
 
 # A summary passes when it contains the explicit nothing-new escape
 # hatch or all four trace verbs (the audit regex the weekly optimizer
@@ -246,7 +249,7 @@ def _missing_loop_trace(summary: Optional[str]) -> Optional[str]:
     """Return a rejection message when a required trace is absent.
 
     Applies only to profiles listed in ``_LOOP_TRACE_REQUIRED_PROFILES``
-    (the orchestrator).  The check is purely textual on the summary +
+    (the orchestrator + frontend pilot).  The check is purely textual on the summary +
     legacy result field, runs BEFORE any DB mutation, and returns a
     retryable tool_error — the task stays in-flight so the worker can
     simply re-call kanban_complete with the trace appended.
@@ -797,9 +800,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             "provide at least one of: summary (preferred), result"
         )
-    # LOOP-CLOSURE LAW gate (card t_31b252aa): scoped to the
-    # orchestrator profile — reject trace-less completion summaries
-    # BEFORE any DB mutation so the worker can retry cheaply.
+    # LOOP-CLOSURE LAW gate (cards t_31b252aa + t_a617051b): scoped to
+    # the orchestrator + frontend pilot — reject trace-less completion
+    # summaries BEFORE any DB mutation so the worker can retry cheaply.
     loop_trace_err = _missing_loop_trace(summary or result)
     if loop_trace_err:
         return tool_error(loop_trace_err)
@@ -1850,7 +1853,7 @@ KANBAN_COMPLETE_SCHEMA = {
         "... / do-differently: ...' — or the explicit line "
         "'loop-closure: nothing new' when the run genuinely taught "
         "nothing. Trace-less completions are rejected (enforced for "
-        "the orchestrator profile)."
+        "the orchestrator + frontend profiles)."
     ),
     "parameters": {
         "type": "object",
