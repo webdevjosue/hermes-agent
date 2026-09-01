@@ -1363,6 +1363,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
+    -- REAL progress timestamps (progress-flagged heartbeats: new tool
+    -- name/args, non-empty assistant text, explicit kanban_heartbeat).
+    -- Distinguished from last_heartbeat_at because the run-244 wedge
+    -- (t_3df0dd33) showed passive stream/wait ticks keeping the heartbeat
+    -- alive for hours while zero actual progress happened.
+    last_progress_at     INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
@@ -2608,6 +2614,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
+        )
+    if "last_progress_at" not in cols:
+        # Run-244 wedge (t_3df0dd33): REAL progress timestamps (progress-
+        # flagged heartbeats) vs raw liveness. NULL until the worker's
+        # first progress heartbeat; detect_progress_stalled treats NULL as
+        # "not enough signal" and leaves the task alone.
+        _add_column_if_missing(
+            conn, "tasks", "last_progress_at", "last_progress_at INTEGER"
         )
     if "current_run_id" not in cols:
         _add_column_if_missing(
@@ -8069,6 +8083,11 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    progress_stalled: list[str] = field(default_factory=list)
+    """Task ids reclaimed because their heartbeat stayed alive while real
+    progress (``last_progress_at``) went stale beyond
+    ``kanban.progress_watchdog.progress_stale_seconds`` — the run-244
+    wedge signature (t_3df0dd33)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -8386,6 +8405,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    progress: bool = False,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -8393,6 +8413,15 @@ def heartbeat_worker(
     the PID check. A worker that forks a long-lived child (train loop,
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
+
+    ``progress=True`` marks this heartbeat as REAL forward progress (new
+    tool call, new args, non-empty assistant text, or the explicit
+    ``kanban_heartbeat`` tool) and additionally stamps the durable
+    ``last_progress_at`` column. The dispatcher's progress watchdog
+    (``detect_progress_stalled``) distinguishes "heartbeat alive but
+    nothing changing" (the run-244 wedge signature, t_3df0dd33) from a
+    healthy worker via this column. Default False keeps the passive
+    liveness-only semantics of every pre-existing caller.
 
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
@@ -8413,6 +8442,17 @@ def heartbeat_worker(
             )
         if cur.rowcount != 1:
             return False
+        if progress:
+            try:
+                conn.execute(
+                    "UPDATE tasks SET last_progress_at = ? WHERE id = ?",
+                    (now, task_id),
+                )
+            except sqlite3.OperationalError:
+                # Legacy board without the column (pre-migration): the
+                # heartbeat itself already succeeded; progress stamping is
+                # best-effort and must not fail the call.
+                pass
         run_id = (
             int(expected_run_id)
             if expected_run_id is not None
@@ -8425,7 +8465,9 @@ def heartbeat_worker(
             )
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            ({"note": note} if note else None) or (
+                {"progress": True} if progress else None
+            ),
             run_id=run_id,
         )
     return True
@@ -8507,7 +8549,7 @@ def enforce_max_runtime(
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (retry_status, tid, pid, row["claim_lock"]),
@@ -8638,7 +8680,7 @@ def detect_stale_running(
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
                 (retry_status, tid, row["claim_lock"]),
@@ -8684,6 +8726,150 @@ def detect_stale_running(
         # event already lives in task_events for auditability; that's the
         # right surface for "this happened" without conflating with the
         # spawn_failed / timed_out / crashed counters.
+
+    return reclaimed
+
+
+# Progress-staleness watchdog (run-244 wedge, t_3df0dd33): conservative
+# defaults, config-gated via kanban.progress_watchdog.* (default OFF).
+DEFAULT_PROGRESS_STALE_SECONDS = 1800
+DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS = 600
+
+
+def detect_progress_stalled(
+    conn: sqlite3.Connection,
+    *,
+    progress_stale_seconds: int = 0,
+    min_runtime_seconds: int = DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
+    signal_fn=None,
+) -> list[str]:
+    """Reclaim ``running`` tasks whose heartbeat is ALIVE but whose progress
+    is stale (run-244 wedge class).
+
+    Complements ``detect_stale_running`` (which needs a 1h heartbeat GAP)
+    with a divergence signal: ``last_heartbeat_at`` fresh (the auto
+    heartbeat bridge / worker still ticking) while ``last_progress_at``
+    (progress-flagged heartbeats only) is older than
+    ``progress_stale_seconds``. In the run-244 incident the wedge polled a
+    hung process with identical ``process(action="wait")`` calls for ~4h —
+    byte-identical except timeout drift — so passive heartbeats masked the
+    stall. With the progress-gated bridge (half 1) identical re-issues stop
+    counting as progress and this check reclaims within minutes of the
+    threshold.
+
+    Conservative by design:
+
+    - ``progress_stale_seconds=0`` (default / config disabled) -> no-op.
+    - NULL ``last_progress_at`` (worker never reported progress — pre-half-1
+      workers, or a long single tool call before any progress signal) is
+      NOT flagged; the heartbeat-gap checks own that case. This keeps the
+      check additive: no false reclaims of slow-but-healthy workers.
+    - Tasks younger than ``min_runtime_seconds`` are skipped.
+    - Reclaim follows the same path as ``detect_stale_running``: terminate
+      host-local worker, defer if it survives, restore source phase, close
+      run with ``outcome='progress_stalled'``, no failure counter.
+
+    Returns the list of reclaimed task ids.
+    """
+    if progress_stale_seconds <= 0:
+        return []
+
+    # Fail-open on legacy boards without the column (DROPped in tests too).
+    try:
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        return []
+    if "last_progress_at" not in cols:
+        return []
+
+    now = int(time.time())
+    reclaimed: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.last_progress_at, "
+        "       t.claim_lock, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running'"
+    ).fetchall()
+
+    for row in rows:
+        if row["active_started_at"] is None:
+            continue
+        elapsed = now - int(row["active_started_at"])
+        if elapsed < min_runtime_seconds:
+            continue
+
+        last_hb = row["last_heartbeat_at"]
+        last_prog = row["last_progress_at"]
+        if last_hb is None or last_prog is None:
+            continue  # not enough signal; heartbeat-gap checks own NULLs
+        hb_age = now - int(last_hb)
+        prog_age = now - int(last_prog)
+        # Divergence signature: heartbeat alive, progress stale.
+        if hb_age >= _STALE_HEARTBEAT_GAP_SECONDS:
+            continue  # detect_stale_running already owns this task
+        if prog_age < progress_stale_seconds:
+            continue
+
+        pid = row["worker_pid"]
+        tid = row["id"]
+        lock = row["claim_lock"] or ""
+
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="progress_stalled_worker_alive",
+            )
+            continue
+
+        with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, tid)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND claim_lock IS ?",
+                (retry_status, tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+
+            payload = {
+                "reason": "progress_stalled",
+                "elapsed_seconds": int(elapsed),
+                "last_heartbeat_at": int(last_hb),
+                "heartbeat_age_seconds": int(hb_age),
+                "last_progress_at": int(last_prog),
+                "progress_age_seconds": int(prog_age),
+                "progress_stale_seconds": int(progress_stale_seconds),
+                "pid": int(pid) if pid else None,
+                "retry_status": retry_status,
+            }
+            payload.update(termination)
+
+            run_id = _end_run(
+                conn, tid,
+                outcome="progress_stalled", status="progress_stalled",
+                error=(
+                    f"no progress for {int(prog_age)}s while heartbeats "
+                    f"stayed fresh (last {int(hb_age)}s ago) after "
+                    f"{int(elapsed)}s running"
+                ),
+                metadata=payload,
+            )
+            _append_event(
+                conn, tid, "progress_stalled", payload, run_id=run_id,
+            )
+            reclaimed.append(tid)
 
     return reclaimed
 
@@ -8734,7 +8920,7 @@ def reconcile_orphaned_running(
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
                 (tid, row["claim_lock"], row["claim_expires"]),
@@ -9830,6 +10016,8 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    progress_stale_seconds: int = 0,
+    progress_min_runtime_seconds: int = DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9865,6 +10053,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            progress_stale_seconds=progress_stale_seconds,
+            progress_min_runtime_seconds=progress_min_runtime_seconds,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9885,6 +10075,8 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                progress_stale_seconds=progress_stale_seconds,
+                progress_min_runtime_seconds=progress_min_runtime_seconds,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9912,6 +10104,8 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    progress_stale_seconds: int = 0,
+    progress_min_runtime_seconds: int = DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9961,6 +10155,15 @@ def _dispatch_once_locked(
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
+    )
+    # Progress-staleness watchdog (run-244 wedge class): reclaims running
+    # tasks whose heartbeat cadence is alive but whose real progress
+    # (last_progress_at) went stale. Additive + config-gated; a 0/absent
+    # threshold is a no-op (see detect_progress_stalled).
+    result.progress_stalled = detect_progress_stalled(
+        conn,
+        progress_stale_seconds=progress_stale_seconds,
+        min_runtime_seconds=progress_min_runtime_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
