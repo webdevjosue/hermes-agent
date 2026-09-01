@@ -5484,6 +5484,18 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ClaimOwnershipError(RuntimeError):
+    """A terminal transition was attempted on a live claim this caller
+    does not own (no matching ``expected_run_id``, no ``force=True``).
+
+    Raised by :func:`complete_task` before any mutation. Registry-level
+    twin of the M1 guard in :func:`request_review`. Root cause: run-263
+    incident (card t_7f85aa6f) — an interactive session with no
+    dispatcher env completed a dispatcher-spawned worker's card
+    mid-run, hijacking the run row's attribution.
+    """
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5497,6 +5509,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    force: bool = False,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5536,6 +5549,51 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    # Live-claim ownership gate (run-263 incident, card t_7f85aa6f):
+    # an unaffiliated caller (e.g. an interactive session with no
+    # dispatcher env) must not complete — and thereby clear the claim of
+    # and hijack attribution on — a run belonging to a live worker.
+    # Mirrors the M1 guard in ``request_review``: prove ownership via
+    # ``expected_run_id`` or explicitly override with ``force=True``
+    # (human/CLI/dashboard). Same two-phase shape as the hallucination
+    # gate below: auditable refusal event in a tiny dedicated txn, then
+    # raise BEFORE any task-state mutation; re-checked CAS-style inside
+    # the main txn to close the claim race.
+    if expected_run_id is None and not force:
+        _live = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            _live is not None
+            and _live["status"] == "running"
+            and (
+                _live["claim_lock"] is not None
+                or _live["current_run_id"] is not None
+            )
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_refused_claim_ownership",
+                    {
+                        "reason": "live_claim_not_owned",
+                        "claim_lock": _live["claim_lock"],
+                        "current_run_id": _live["current_run_id"],
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise ClaimOwnershipError(
+                f"task {task_id} is running under a live claim "
+                f"(lock={_live['claim_lock']!r}, "
+                f"run={_live['current_run_id']}); complete refused. "
+                f"Pass expected_run_id (worker ownership) or "
+                f"force=True (explicit operator override)."
+            )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5578,6 +5636,25 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Live-claim ownership re-check inside the main txn (closes the
+        # claim race the pre-txn gate can't see; see run-263 guard).
+        if (
+            expected_run_id is None
+            and not force
+            and prior_status == "running"
+        ):
+            live = conn.execute(
+                "SELECT claim_lock, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if live is not None and (
+                live["claim_lock"] is not None
+                or live["current_run_id"] is not None
+            ):
+                raise ClaimOwnershipError(
+                    f"task {task_id} was claimed mid-flight; complete "
+                    f"refused (pass expected_run_id or force=True)."
+                )
         if expected_run_id is None:
             cur = conn.execute(
                 """
