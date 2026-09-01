@@ -95,8 +95,11 @@ from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
+    is_zai_coding_transient_auth_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
+    zai_coding_transient_auth_backoff,
+    ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET,
 )
 from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
@@ -5737,6 +5740,86 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
+
+                # ── Z.AI Coding transient 401/1000: bounded retry ────────
+                # The Coding Plan endpoint intermittently returns HTTP 401
+                # code 1000 "Authentication Failed" under concurrent load
+                # (2026-08-31 peak) while sibling workers on the SAME
+                # account succeed in the same window — a transient blip,
+                # not a dead key. Before escalating to the auth-failover /
+                # terminal path below (which switches models mid-session),
+                # spend a small bounded budget retrying the SAME provider
+                # with ~30s/~60s adaptive waits. When the budget exhausts,
+                # fall through to the EXISTING auth-failover + terminal
+                # handling unchanged — a genuinely dead key must still
+                # reach fallback/terminal quickly.
+                if (
+                    classified.is_auth
+                    and _retry.zai_transient_auth_retries < ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET
+                    and is_zai_coding_transient_auth_error(
+                        base_url=str(_base), model=_model, error=api_error
+                    )
+                ):
+                    _retry.zai_transient_auth_retries += 1
+                    # Keep the while-guard (retry_count < max_retries) from
+                    # cutting the bounded budget short on configs with a
+                    # small api_max_retries — same ceiling-raise rationale
+                    # as zai_coding_overload_retry_ceiling at the 429 site.
+                    max_retries = max(max_retries, ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET + 1)
+                    _zai_auth_wait = zai_coding_transient_auth_backoff(
+                        _retry.zai_transient_auth_retries
+                    )
+                    agent._emit_status(
+                        f"🔐 Z.AI auth blip (HTTP 401, code 1000) — retrying same "
+                        f"provider in {_zai_auth_wait:.0f}s "
+                        f"({_retry.zai_transient_auth_retries}/"
+                        f"{ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET})..."
+                    )
+                    logger.warning(
+                        "Z.AI Coding transient 401/1000 — same-provider retry "
+                        "%d/%d after %.0fs %s",
+                        _retry.zai_transient_auth_retries,
+                        ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET,
+                        _zai_auth_wait,
+                        agent._client_log_context(),
+                    )
+                    # Interruptible wait, mirroring the retry-wait pattern:
+                    # 0.2s poll, preserve-redirect on steer, ~30s activity
+                    # touches so the gateway inactivity monitor stays quiet.
+                    _zai_sleep_end = time.time() + _zai_auth_wait
+                    _zai_touch_counter = 0
+                    while time.time() < _zai_sleep_end:
+                        if agent._interrupt_requested:
+                            if agent.clear_interrupt(preserve_redirect=True):
+                                _retry.restart_with_redirected_messages = True
+                                break
+                            _zai_interrupt_text = (
+                                "Operation interrupted during Z.AI transient-auth "
+                                f"retry ({_retry.zai_transient_auth_retries}/"
+                                f"{ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET})."
+                            )
+                            close_interrupted_tool_sequence(messages, _zai_interrupt_text)
+                            agent._persist_session(messages, conversation_history)
+                            agent.clear_interrupt()
+                            return {
+                                "final_response": _zai_interrupt_text,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "interrupted": True,
+                            }
+                        time.sleep(0.2)
+                        _zai_touch_counter += 1
+                        if _zai_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
+                            agent._touch_activity(
+                                f"Z.AI transient-auth retry backoff "
+                                f"({_retry.zai_transient_auth_retries}/"
+                                f"{ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET}), "
+                                f"{int(_zai_sleep_end - time.time())}s remaining"
+                            )
+                    if _retry.restart_with_redirected_messages:
+                        break
+                    continue
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh

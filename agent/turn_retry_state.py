@@ -74,6 +74,14 @@ class TurnRetryState:
     # don't loop on the same auth failover within one attempt.
     auth_failover_attempted: bool = False
 
+    # ── Z.AI Coding transient 401/1000 bounded retry ─────────────────────
+    # Number of same-provider retries already spent on the transient
+    # Z.AI Coding Plan 401/1000 "Authentication Failed" blip (see
+    # ``is_zai_coding_transient_auth_error``). Bounded by
+    # ``ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET``; once exhausted the loop
+    # falls through to the unchanged auth-failover / terminal path.
+    zai_transient_auth_retries: int = 0
+
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False

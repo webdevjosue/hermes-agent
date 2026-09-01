@@ -168,6 +168,54 @@ def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, err
     return "1302" in text or "rate limit reached" in text
 
 
+def is_zai_coding_transient_auth_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
+    """Return True for the transient Z.AI Coding Plan 401/1000 worth of a
+    bounded same-provider retry.
+
+    Production shape (2026-08-31 peak, ~23:00-03:00 PDT): HTTP 401 with body
+    code 1000 "Authentication Failed" from the Coding Plan endpoint on
+    glm-5.3 / glm-5.3-flash under concurrent load, while sibling workers on
+    the SAME account succeeded in the same window — intermittent auth
+    flakiness under load, not a dead key. The generic 401 classification
+    (auth, retryable=False) sent those sessions straight to the terminal
+    client-error exit, killing kanban workers before fallback_providers
+    existed. Scoped as narrowly as ``is_zai_coding_overload_error`` so
+    ordinary 401s on every other provider/model keep failing fast.
+    """
+    base = (base_url or "").lower()
+    model_name = (model or "").lower()
+    status = getattr(error, "status_code", None)
+    text = _error_text(error)
+    if status != 401:
+        return False
+    if "api.z.ai/api/coding/paas/v4" not in base:
+        return False
+    if "glm-5" not in model_name:
+        return False
+    return "1000" in text or "authentication failed" in text
+
+
+_ZAI_CODING_TRANSIENT_AUTH_BACKOFF = (30.0, 60.0)
+
+# Per-run budget of same-provider retries for the transient 401/1000 above:
+# enough to ride out the observed blip windows, small enough that a
+# genuinely dead key still reaches fallback/terminal quickly (~90s worst
+# case). Counted on TurnRetryState so it resets per API-call block.
+ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET = len(_ZAI_CODING_TRANSIENT_AUTH_BACKOFF)
+
+
+def zai_coding_transient_auth_backoff(retry_number: int) -> float:
+    """Adaptive-style wait for the n-th transient-auth retry (1-based).
+
+    30s then 60s (plus light jitter), clamped past the table so an
+    over-budget caller can't IndexError. Mirrors the wait style of
+    ``adaptive_rate_limit_backoff``'s long tier.
+    """
+    idx = min(max(retry_number, 1) - 1, len(_ZAI_CODING_TRANSIENT_AUTH_BACKOFF) - 1)
+    base_delay = _ZAI_CODING_TRANSIENT_AUTH_BACKOFF[idx]
+    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2)
+
+
 def adaptive_rate_limit_backoff(
     attempt: int,
     *,
