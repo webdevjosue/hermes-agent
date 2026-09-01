@@ -244,6 +244,113 @@ def test_zai_coding_matcher_still_scoped_to_coding_endpoint_and_429():
 
 
 # ---------------------------------------------------------------------------
+# Z.AI Coding transient 401/1000 — bounded same-provider retry (2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+def _zai_transient_auth_error():
+    """The 2026-08-31 peak (~23:00-03:00 PDT) crash shape: HTTP 401 with body
+    code 1000 'Authentication Failed' from the Coding Plan endpoint on
+    glm-5.3 / glm-5.3-flash while sibling workers on the SAME account
+    succeeded in the same window — intermittent auth flakiness under load,
+    not a dead key. Killed seo sessions 20260831_233032_3ec490 /
+    20260831_234540_e17d07 and designer session 20260831_232933_b33e0a as
+    non_retryable_client_error on their first hit."""
+    return SimpleNamespace(
+        status_code=401,
+        message="Error code: 401 - {'error': {'code': '1000', 'message': 'Authentication Failed'}}",
+        body={
+            "error": {
+                "code": "1000",
+                "message": "Authentication Failed",
+            }
+        },
+    )
+
+
+def test_zai_coding_transient_auth_1000_matches():
+    """Both observed model spellings (glm-5.3 from the seo dumps,
+    glm-5.3-flash from the designer dump) must match the transient-auth
+    matcher so the loop retries the same provider before any failover."""
+    from agent.retry_utils import is_zai_coding_transient_auth_error
+
+    for model in ("glm-5.3", "glm-5.3-flash"):
+        assert is_zai_coding_transient_auth_error(
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            model=model,
+            error=_zai_transient_auth_error(),
+        ) is True
+
+
+def test_zai_coding_transient_auth_backoff_is_30_then_60(monkeypatch):
+    """The bounded same-provider retry waits ~30s then ~60s (adaptive-wait
+    style: table base + light jitter), and the budget matches the table.
+
+    The module is resolved *inside* the test so the monkeypatch and the
+    imported helper share one module object even when earlier suite tests
+    evicted/re-imported ``agent.retry_utils`` in ``sys.modules`` (a stale
+    top-level binding would patch a dead copy and the real jitter would
+    leak into the assertion)."""
+    import agent.retry_utils as live_retry_utils
+
+    monkeypatch.setattr(
+        live_retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"]
+    )
+    ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET = live_retry_utils.ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET
+    zai_coding_transient_auth_backoff = live_retry_utils.zai_coding_transient_auth_backoff
+
+    waits = [
+        zai_coding_transient_auth_backoff(n)
+        for n in range(1, ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET + 1)
+    ]
+    assert waits == [30.0, 60.0]
+    assert ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET == 2
+    # Clamped beyond the table so an over-budget caller can't IndexError.
+    assert zai_coding_transient_auth_backoff(99) == 60.0
+
+
+def test_zai_coding_transient_auth_matcher_negatives():
+    """The matcher must stay scoped: a plain OpenAI-style 401, a non-coding
+    z.ai base_url, a non-GLM-5 model, and a 401 whose body code is not 1000
+    all stay OUTSIDE the bounded retry (they keep the generic fail-fast +
+    fallback 401 classification)."""
+    from agent.retry_utils import is_zai_coding_transient_auth_error
+
+    err = _zai_transient_auth_error()
+    # Plain OpenAI-style 401 (different provider/endpoint entirely).
+    openai_err = SimpleNamespace(
+        status_code=401,
+        message="Error code: 401 - Incorrect API key provided",
+        body={"error": {"message": "Incorrect API key provided"}},
+    )
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.openai.com/v1", model="gpt-5.1", error=openai_err
+    ) is False
+    # Right error shape, wrong endpoint (public PAAS API, not Coding Plan).
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.z.ai/api/paas/v4", model="glm-5.3", error=err
+    ) is False
+    # Right error shape, non-GLM-5 model.
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-4.5-flash", error=err
+    ) is False
+    # Right endpoint/model but a 401 with a different body code — that is a
+    # real credential problem, not the transient blip.
+    other_code = SimpleNamespace(
+        status_code=401,
+        message="Error code: 401 - {'error': {'code': '401', 'message': 'Invalid key'}}",
+        body={"error": {"code": "401", "message": "Invalid key"}},
+    )
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3", error=other_code
+    ) is False
+    # And the overload matcher must NOT swallow the auth shape (401 ≠ 429).
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3", error=err
+    ) is False
+
+
+# ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
 
