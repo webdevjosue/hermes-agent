@@ -2964,6 +2964,18 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Progress watchdog (run-244 wedge class, t_3df0dd33): reclaims a
+        # running task whose heartbeat cadence is ALIVE but whose real
+        # progress (progress-flagged heartbeats — new tool name/args,
+        # non-empty assistant text, explicit kanban_heartbeat) has been
+        # stale for ``progress_stale_seconds``. Default OFF; enable on
+        # fleets that saw the verbatim-retry wedge. ``min_runtime_seconds``
+        # protects young tasks from a slow first LLM call being flagged.
+        "progress_watchdog": {
+            "enabled": False,
+            "progress_stale_seconds": 1800,
+            "min_runtime_seconds": 600,
+        },
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible
