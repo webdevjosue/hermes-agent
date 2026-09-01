@@ -2023,6 +2023,23 @@ def init_agent(
         agent._empty_guard_cost_threshold_usd,
     ) = resolve_guard_settings(_agent_section.get("empty_response_guard"))
 
+    # Near-identical tool-call repetition watchdog (run-244 wedge class):
+    # additive ``agent.repetition_watchdog`` subsection. Tolerant resolution
+    # — malformed config falls back to defaults (enabled, streak 5, 2
+    # nudges, grace 3). See agent/tool_call_repetition_watchdog.py.
+    try:
+        from agent.tool_call_repetition_watchdog import RepetitionWatchdogState
+
+        agent._repetition_watchdog = RepetitionWatchdogState.from_config_section(
+            _agent_section.get("repetition_watchdog")
+        )
+    except Exception:
+        from agent.tool_call_repetition_watchdog import RepetitionWatchdogState
+
+        agent._repetition_watchdog = RepetitionWatchdogState()
+    agent._repetition_watchdog_pending_nudge = None
+    agent._repetition_watchdog_force_end = False
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the

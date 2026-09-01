@@ -2800,6 +2800,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_dropped_toolcall_nudge",
+    "_repetition_watchdog_synthetic",
 )
 
 

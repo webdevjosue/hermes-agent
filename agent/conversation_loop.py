@@ -7874,6 +7874,47 @@ def run_conversation(
                     failed = True
                     break
 
+                # ── Repetition-watchdog force-end (run-244 wedge class) ──
+                # The near-identical-call streak persisted past the nudge
+                # budget (see agent/tool_call_repetition_watchdog.py). The
+                # model cannot break out on its own — end the turn with a
+                # clear finish reason so the worker surfaces (dispatcher
+                # sees the exit, heartbeat stalls become visible) instead
+                # of burning hours re-issuing the same call.
+                if getattr(agent, "_repetition_watchdog_force_end", False):
+                    from agent.tool_call_repetition_watchdog import (
+                        REPETITION_WATCHDOG_FINISH_REASON,
+                    )
+
+                    _watchdog = getattr(agent, "_repetition_watchdog", None)
+                    _wd_streak = getattr(_watchdog, "_streak", 0) if _watchdog else 0
+                    _wd_call = getattr(_watchdog, "_last_call_desc", "") if _watchdog else ""
+                    _turn_exit_reason = REPETITION_WATCHDOG_FINISH_REASON
+                    final_response = (
+                        "[Turn ended by repetition watchdog: the same tool "
+                        f"call was issued {_wd_streak} consecutive times"
+                        + (f" ({_wd_call})" if _wd_call else "")
+                        + ". Nudges to change strategy were ignored. End of "
+                        "turn — surface the state of this task now."
+                    )
+                    agent._emit_status(
+                        f"⚠️ Repetition watchdog force-ended the turn after "
+                        f"{_wd_streak} near-identical calls: {_wd_call[:120]}"
+                    )
+                    append_message(messages, {"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    # Consume the flag so a resumed turn starts clean.
+                    agent._repetition_watchdog_force_end = False
+                    agent._repetition_watchdog_pending_nudge = None
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
