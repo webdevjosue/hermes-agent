@@ -151,6 +151,23 @@ DEFAULT_CONFIG = {
             # leaves the budget untouched.
             "cost_threshold_usd": 0.25,
         },
+        # Near-identical tool-call repetition watchdog (run-244 wedge
+        # class). A live model wedged re-issuing the same call (observed:
+        # process(wait) x76 over ~4h, timeout numeric drifting 170→178)
+        # is immune to result-text mitigation. The watchdog tracks a
+        # rolling signature (tool name + args with volatile numerics like
+        # timeout/wait dropped) at the tool-executor seam; at max_streak
+        # it fires a bounded synthetic nudge ordering a strategy change,
+        # and after max_nudges nudges (spaced nudge_grace calls apart) it
+        # force-ends the turn so the worker surfaces. Any different call
+        # resets the streak, so paging reads, poll/log alternation, and
+        # arg-changing retries never trigger it.
+        "repetition_watchdog": {
+            "enabled": True,
+            "max_streak": 5,
+            "max_nudges": 2,
+            "nudge_grace": 3,
+        },
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

@@ -291,6 +291,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # repetition-watchdog nudge (run-244 wedge class): bounded synthetic
+    # user nudge appended after a near-identical tool-call streak; exists
+    # only to steer the live turn, must not replay on resume.
+    "_repetition_watchdog_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
     # and the "issue the actual tool call now" user nudge exist only to
