@@ -2252,6 +2252,13 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     except kb.AttachmentTooLarge as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 1
+    except ValueError as exc:
+        # Evidence-integrity gate (AttachmentSignatureError /
+        # AttachmentVerificationError, card t_a4c2395b): the file on disk
+        # contradicts its own name or the write didn't verify — refuse
+        # loudly, mirroring the agent-tool error surface.
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
     print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes)")
     return 0
 
