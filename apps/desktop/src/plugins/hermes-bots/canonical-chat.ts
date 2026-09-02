@@ -280,6 +280,15 @@ export function createCanonicalChat(
   // Every open of a just-minted row is the same call — adopting a concurrent
   // flight's result, the retry after a failed eager title, the retry after the
   // compat kickoff. Only WHEN differs, so WHAT lives in one place.
+  //
+  // keepAllProfilesScope is UNCONDITIONALLY true, matching openStoredBotChat:
+  // a bot open is navigation, never a chrome-home switch. The old
+  // `route ? true : false` split workspace-switched LOCAL bots onto their own
+  // profile — $activeGatewayProfile followed the bot (e.g. 'video'), the
+  // Sessions sidebar followed $activeGatewayProfile, and leaving Bot Mode
+  // never restored the launch profile, so the user read the collapse as
+  // "dropped out of default" and had to click default to get back (#t_34289f15
+  // symptom A). Remote bots already kept the scope; now local bots do too.
   const openFreshCanonical = (sid: string) =>
     host.openSession!(sid, {
       ...(route
@@ -289,7 +298,7 @@ export function createCanonicalChat(
         : {}),
       profile: name,
       intent: 'main',
-      keepAllProfilesScope: route ? true : false,
+      keepAllProfilesScope: true,
       workspaceMode: 'bots',
       workspaceOwnerKey: botWorkspaceOwnerKey(bot),
       tabTitle: CANONICAL_CHAT_TITLE
