@@ -8214,12 +8214,48 @@ class DispatchResult:
 # ``detect_crashed_workers`` to classify a dead-pid task.
 #
 # Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``. We keep raw status
-# so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
-# be consulted. Entries are trimmed by age (and total size cap as a
-# belt-and-braces against unbounded growth on exotic platforms).
+# so the wait-status decoders below (``_wifexited`` / ``_wexitstatus`` /
+# ``_wifsignaled`` / ``_wtermsig``) can be consulted. Entries are trimmed by
+# age (and total size cap as a belt-and-braces against unbounded growth on
+# exotic platforms).
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+
+
+# ---------------------------------------------------------------------------
+# Wait-status decoding without the POSIX-only ``os`` macros.
+#
+# ``os.WIFEXITED`` / ``os.WEXITSTATUS`` / ``os.WIFSIGNALED`` / ``os.WTERMSIG``
+# do not exist on Windows CPython, so a macro-based classifier silently
+# degraded every recorded exit to ``unknown`` there (the ``AttributeError``
+# was swallowed) — a clean rc=0 exit (protocol violation) and the
+# rate-limit sentinel were both accounted as plain crashes, tripping the
+# unified failure breaker on the first violation. The POSIX wait-status
+# layout is a fixed encoding, so decode it explicitly: identical results on
+# every platform, no dependency on which macros the local ``os`` module
+# happens to export.
+# ---------------------------------------------------------------------------
+
+def _wifexited(raw: int) -> bool:
+    """``True`` when the wait status encodes a normal exit (no signal bits)."""
+    return (raw & 0x7F) == 0
+
+
+def _wexitstatus(raw: int) -> int:
+    """Exit code byte of a normal-exit wait status (``code << 8``)."""
+    return (raw >> 8) & 0xFF
+
+
+def _wifsignaled(raw: int) -> bool:
+    """``True`` when the wait status encodes death by signal."""
+    low = raw & 0x7F
+    return 0 < low < 0x7F
+
+
+def _wtermsig(raw: int) -> int:
+    """Signal number of a killed-by-signal wait status."""
+    return raw & 0x7F
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -8274,15 +8310,20 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("unknown", None)
     raw, _ = entry
     try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
+        # POSIX wait-status layout, decoded explicitly (see _wifexited):
+        # os.WIFEXITED & co. don't exist on Windows CPython, and the old
+        # macro-based lookup silently classified every exit as "unknown"
+        # there — clean exits and rate-limit bailouts both counted as
+        # crashes against the unified failure breaker.
+        if _wifexited(raw):
+            code = _wexitstatus(raw)
             if code == 0:
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
             return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
+        if _wifsignaled(raw):
+            return ("signaled", _wtermsig(raw))
     except Exception:
         pass
     return ("unknown", None)
