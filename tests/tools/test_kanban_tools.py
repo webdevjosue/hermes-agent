@@ -66,6 +66,17 @@ def worker_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    # Owner contract for the live-claim guard (run-263, t_7f85aa6f): a
+    # dispatched worker always carries HERMES_KANBAN_RUN_ID, and
+    # kanban_complete refuses non-owner completes on a live claim.
+    # Pin it to the run the claim created so these worker-env tests
+    # exercise the owning-worker path, not the refused-outsider path.
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
     return tid
 
 
