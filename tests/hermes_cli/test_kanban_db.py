@@ -10,7 +10,7 @@ import sys
 import time
 import types
 import unittest.mock
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import pytest
 
@@ -566,7 +566,14 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    # git worktree list --porcelain always emits forward slashes, while
+    # str(Path) on Windows uses backslashes — compare as normalized paths.
+    listed_worktrees = [
+        PurePath(line[len("worktree "):].strip())
+        for line in listed.splitlines()
+        if line.startswith("worktree ")
+    ]
+    assert PurePath(target) in listed_worktrees
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1188,7 +1195,12 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    # On Windows the resolver bypasses shutil.which in favor of its own
+    # cwd-safe PATH scan (_safe_which_no_cwd), so patch both probes —
+    # otherwise a real hermes.EXE on PATH keeps the fallback branch from
+    # ever running.
     monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(kb, "_safe_which_no_cwd", lambda command: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
