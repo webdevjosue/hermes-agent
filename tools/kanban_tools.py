@@ -1227,6 +1227,7 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                 continue
             resp.raise_for_status()
             content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
+            content_length_hdr = resp.headers.get("content-length")
             for chunk in resp.iter_bytes(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
@@ -1234,7 +1235,24 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                         f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
                     )
                 chunks.append(chunk)
-        return b"".join(chunks), content_type
+        data = b"".join(chunks)
+        # Evidence-integrity cross-check (card t_a4c2395b): a server (or a
+        # proxy) that truncates the body while declaring a larger
+        # Content-Length yields a silently corrupt attachment. Mismatch →
+        # loud failure; the caller can retry.
+        declared: Optional[int] = None
+        if content_length_hdr:
+            try:
+                declared = int(content_length_hdr.strip())
+            except ValueError:
+                declared = None
+        if declared is not None and declared != len(data):
+            raise ValueError(
+                f"Content-Length mismatch fetching {url}: header declared "
+                f"{declared} bytes but {len(data)} bytes were received — the "
+                f"transfer was truncated; refusing to store a partial file."
+            )
+        return data, content_type
     raise ValueError(f"too many redirects fetching {url}")
 
 
@@ -2041,7 +2059,12 @@ KANBAN_ATTACH_SCHEMA = {
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "kanban_attach_url when you only have a URL. IMPORTANT: the "
+        "payload's magic bytes are verified against the filename "
+        "extension and against what lands on disk — a base64 blob you "
+        "composed from memory (a truncated or fabricated file header) "
+        "will be REJECTED. Read the real file and base64-encode its "
+        "actual bytes, or use kanban_attach_url."
     ),
     "parameters": {
         "type": "object",

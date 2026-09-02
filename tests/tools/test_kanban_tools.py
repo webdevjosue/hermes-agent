@@ -1109,7 +1109,10 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
 
     _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
 
-    payload = b"public fetch body"
+    # Real PDF magic bytes: the evidence-integrity gate in
+    # store_attachment_bytes rejects a .pdf whose payload doesn't start
+    # with %PDF- (fleet bug t_e5db5332).
+    payload = b"%PDF-1.4 public fetch body"
 
     def fake_stream(method, url, **kwargs):
         assert url == "http://files.example.com/docs/spec.pdf"
@@ -1132,5 +1135,241 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert [a.filename for a in atts] == ["spec.pdf"]
         assert atts[0].content_type == "application/pdf"
         assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Attachments — evidence integrity (fleet bug t_e5db5332 / card t_a4c2395b)
+#
+# kanban_attach once stored a 17-byte fabricated stub (hex 00000018 66746f70
+# + zeros — a made-up ISO-BMFF box, not PNG) as "remotion-smoke-frame.png"
+# and reported SUCCESS, because store_attachment_bytes trusted the payload
+# blindly. These tests pin the loud-failure contract.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_png() -> bytes:
+    """Build a minimal valid 1x1 RGBA PNG (no fixture file needed)."""
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x00\x00\x00\x00")  # filter byte + RGBA pixel
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", idat)
+        + chunk(b"IEND", b"")
+    )
+
+
+def _no_attachment_left(conn, task_id):
+    from hermes_cli import kanban_db as kb
+
+    assert kb.list_attachments(conn, task_id) == []
+    att_dir = kb.task_attachments_dir(task_id)
+    if att_dir.exists():
+        assert list(att_dir.iterdir()) == [], f"orphan blob under {att_dir}"
+
+
+def test_attach_rejects_fabricated_png_stub(worker_env):
+    """The exact fleet failure: 17 bytes of made-up 'ftop' box passed as a
+    .png must fail loudly with a signature error, leaving no row and no
+    orphan blob on disk."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    stub = bytes.fromhex("0000001866746f70") + b"\x00" * 9  # 'ftop' + zeros
+    out = kt._handle_attach(
+        {
+            "task_id": worker_env,
+            "filename": "remotion-smoke-frame.png",
+            "content_base64": base64.b64encode(stub).decode(),
+        }
+    )
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "signature" in d["error"].lower(), out
+    assert "png" in d["error"].lower(), out
+
+    conn = kb.connect()
+    try:
+        _no_attachment_left(conn, worker_env)
+    finally:
+        conn.close()
+
+
+def test_attach_rejects_ascii_payload_with_binary_extension(worker_env):
+    """Fleet stub variant (t_677179b7): a .png whose bytes are an ASCII
+    'HTTP/1.1 200' status line is fabricated evidence — reject it."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach(
+        {
+            "task_id": worker_env,
+            "filename": "live_post_fixed.png",
+            "content_base64": base64.b64encode(b"HTTP/1.1 200 OK\r\n").decode(),
+        }
+    )
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "signature" in d["error"].lower(), out
+
+    conn = kb.connect()
+    try:
+        _no_attachment_left(conn, worker_env)
+    finally:
+        conn.close()
+
+
+def test_attach_real_png_roundtrip(worker_env):
+    """No false positives: a genuinely valid PNG attaches unchanged."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    png = _tiny_png()
+    out = kt._handle_attach(
+        {
+            "task_id": worker_env,
+            "filename": "real.png",
+            "content_base64": base64.b64encode(png).decode(),
+            "content_type": "image/png",
+        }
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert len(atts) == 1
+        from pathlib import Path
+
+        assert Path(atts[0].stored_path).read_bytes() == png
+    finally:
+        conn.close()
+
+
+def test_attach_fails_loud_when_storage_write_corrupts(worker_env, monkeypatch):
+    """Corruption-injection regression: if the disk write silently truncates
+    (the 'bytes get mangled between payload and final storage' seam), the
+    attach must FAIL, not log success with a corrupt blob."""
+    import base64
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    real_write = Path.write_bytes
+
+    def truncating_write(self, data):
+        real_write(self, data[: max(1, len(data) // 3)])
+        return len(data)  # lie about the write like a broken transport
+
+    monkeypatch.setattr(Path, "write_bytes", truncating_write)
+
+    png = _tiny_png()
+    out = kt._handle_attach(
+        {
+            "task_id": worker_env,
+            "filename": "truncated.png",
+            "content_base64": base64.b64encode(png).decode(),
+        }
+    )
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "verif" in d["error"].lower() or "mismatch" in d["error"].lower(), out
+
+    conn = kb.connect()
+    try:
+        _no_attachment_left(conn, worker_env)
+    finally:
+        conn.close()
+
+
+def test_attach_url_rejects_content_length_mismatch(
+    worker_env, default_url_guard, monkeypatch
+):
+    """kanban_attach_url must cross-check Content-Length vs received bytes —
+    a proxy silently truncating the body is a corrupt-attachment seed."""
+    import httpx
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
+
+    def fake_stream(method, url, **kwargs):
+        return _FakeStreamResponse(
+            status_code=200,
+            headers={
+                "content-type": "image/png",
+                "content-length": "4096",  # lies: only a stub arrives
+            },
+            body=b"\x89PNG\r\n\x1a\njunk",
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    out = kt._handle_attach_url({"url": "http://files.example.com/img.png"})
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "content-length" in d["error"].lower(), out
+
+    conn = kb.connect()
+    try:
+        _no_attachment_left(conn, worker_env)
+    finally:
+        conn.close()
+
+
+def test_attach_url_happy_path_with_matching_content_length(
+    worker_env, default_url_guard, monkeypatch
+):
+    """A consistent Content-Length must not break the happy path."""
+    import httpx
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
+    png = _tiny_png()
+
+    def fake_stream(method, url, **kwargs):
+        return _FakeStreamResponse(
+            status_code=200,
+            headers={"content-type": "image/png", "content-length": str(len(png))},
+            body=png,
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    out = kt._handle_attach_url({"url": "http://files.example.com/tiny.png"})
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["tiny.png"]
+        from pathlib import Path
+
+        assert Path(atts[0].stored_path).read_bytes() == png
     finally:
         conn.close()

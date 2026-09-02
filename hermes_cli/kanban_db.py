@@ -4078,6 +4078,98 @@ class AttachmentTooLarge(ValueError):
     """
 
 
+class AttachmentSignatureError(ValueError):
+    """Raised when a payload's magic bytes contradict its filename extension.
+
+    Fleet bug (2026-09-01, card t_e5db5332): ``kanban_attach`` stored a
+    17-byte fabricated stub (``00000018 66746f70`` + zeros — an invented
+    ISO-BMFF box with no major brand) as ``remotion-smoke-frame.png`` and
+    reported SUCCESS, because the write path trusted the payload blindly.
+    Board-wide forensics found six such stubs — every one a tiny prefix of
+    plausible-looking bytes ("HTTP/1.1 200", "import http.", ``{"ladder_fai``)
+    that a model produced from memory instead of reading the real file.
+
+    The check is *consistency*, not a whitelist: unknown extensions and
+    plain-text payloads always pass; a known binary extension whose payload
+    doesn't start with that format's magic bytes fails loudly.
+    """
+
+
+class AttachmentVerificationError(ValueError):
+    """Raised when bytes read back from disk differ from the payload written.
+
+    Catches a silently truncating/corrupting storage layer (disk pressure,
+    AV interference, a broken transport shim) before a success event is
+    logged — the stored blob is removed and no metadata row is created.
+    """
+
+
+# Magic-byte rules for well-known binary formats. Each entry maps a set of
+# filename extensions to a (predicate, expected-description) pair evaluated
+# against the head of the payload. Extensions not listed here are unchecked.
+_SIG_PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def _is_iso_bmff_ftyp(head: bytes) -> bool:
+    return len(head) >= 12 and head[4:8] == b"ftyp" and all(
+        0x20 <= b <= 0x7E for b in head[8:12]
+    )
+
+
+_ATTACHMENT_SIGNATURE_RULES: tuple = (
+    # (extensions, predicate, expected)
+    (("png",), lambda h: h.startswith(_SIG_PNG), "PNG signature 89 50 4E 47 0D 0A 1A 0A"),
+    (("jpg", "jpeg"), lambda h: h.startswith(b"\xff\xd8\xff"), "JPEG signature FF D8 FF"),
+    (("gif",), lambda h: h[:6] in (b"GIF87a", b"GIF89a"), "GIF header GIF87a/GIF89a"),
+    (("pdf",), lambda h: h.startswith(b"%PDF-"), "PDF header %PDF-"),
+    (("mp4", "m4v", "mov"), _is_iso_bmff_ftyp, "ISO-BMFF ftyp box with a printable major brand"),
+    (("webm", "mkv"), lambda h: h.startswith(b"\x1a\x45\xdf\xa3"), "EBML header 1A 45 DF A3"),
+    (("wav",), lambda h: h[:4] == b"RIFF" and h[8:12] == b"WAVE", "RIFF/WAVE header"),
+    (("avi",), lambda h: h[:4] == b"RIFF" and h[8:12] == b"AVI ", "RIFF/AVI header"),
+    (("webp",), lambda h: h[:4] == b"RIFF" and h[8:12] == b"WEBP", "RIFF/WEBP header"),
+    (
+        ("zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "whl", "apk"),
+        lambda h: h[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+        "ZIP local-file signature PK",
+    ),
+    (("rar",), lambda h: h.startswith(b"Rar!\x1a\x07"), "RAR signature Rar!"),
+    (("7z",), lambda h: h.startswith(b"7z\xbc\xaf\x27\x1c"), "7z signature"),
+    (("gz",), lambda h: h.startswith(b"\x1f\x8b"), "gzip signature 1F 8B"),
+    (("bz2",), lambda h: h.startswith(b"BZh"), "bzip2 signature BZh"),
+    (("xz",), lambda h: h.startswith(b"\xfd7zXZ\x00"), "xz signature FD 37 7A 58 5A 00"),
+)
+
+
+def _validate_attachment_payload(name: str, data: bytes) -> None:
+    """Reject payloads whose bytes contradict a known binary extension.
+
+    Raises :class:`AttachmentSignatureError` (nothing has been written yet)
+    with a message that tells the caller how to recover: re-acquire the real
+    bytes and retry. Zero-byte payloads under a known binary extension are
+    rejected too — an empty ``.png`` is corrupt by definition.
+    """
+    _validate_attachment_head(name, data[:16], len(data))
+
+
+def _validate_attachment_head(name: str, head: bytes, size: int) -> None:
+    """Signature check on the payload head; shared by the byte-buffered
+    store path (:func:`_validate_attachment_payload`) and the dashboard's
+    streaming upload route, which only holds the head + total size."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    for exts, predicate, expected in _ATTACHMENT_SIGNATURE_RULES:
+        if ext in exts:
+            if size == 0 or not predicate(head):
+                raise AttachmentSignatureError(
+                    f"attachment signature mismatch for '{name}': expected "
+                    f"{expected}, got {head.hex()!r} "
+                    f"({size} bytes) — the payload is truncated, "
+                    f"fabricated, or not a real {ext.upper()} file. Refusing "
+                    f"to store corrupt evidence. Re-read the real file bytes "
+                    f"and retry with the complete payload."
+                )
+            return
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -4148,11 +4240,33 @@ def store_attachment_bytes(
         raise AttachmentTooLarge(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
+    # Evidence-integrity gate (fleet bug t_e5db5332): reject a payload whose
+    # magic bytes contradict a known binary extension BEFORE anything is
+    # written. A 17-byte fabricated 'ftop' stub named ".png" must never
+    # reach the board as a success event.
+    _validate_attachment_payload(filename, data)
     safe_name = _safe_attachment_name(filename)
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
+    # Read-back verification: the metadata row's size must describe the
+    # bytes actually on disk, not the payload we *think* we wrote. A silent
+    # truncating write layer is a corrupt-evidence seed; fail loudly and
+    # leave no row behind.
+    stored = dest_path.stat().st_size
+    if stored != len(data):
+        try:
+            dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise AttachmentVerificationError(
+            f"attachment write verification failed for '{dest_path.name}': "
+            f"payload was {len(data)} bytes but {stored} bytes landed on "
+            f"disk — refusing to record a success for a truncated/corrupt "
+            f"blob. Retry the attach; if it persists, investigate the "
+            f"storage layer."
+        )
     try:
         return add_attachment(
             conn,
