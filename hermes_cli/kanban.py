@@ -3476,6 +3476,28 @@ Read-only commands are safe while an agent is running.\
 """
 
 
+def _split_slash_args(rest: str) -> list[str]:
+    """Split a ``/kanban`` argument string into tokens.
+
+    Like ``shlex.split`` (whitespace-split, ``"..."`` / ``'...'`` grouping),
+    but with the backslash *escape* character disabled so Windows absolute
+    paths (``C:\\Users\\...``) survive verbatim.  POSIX ``shlex.split``
+    treats every ``\\`` as an escape and silently deletes it, which turns a
+    valid Windows path into ``C:UsersJosue...`` before ``attach``'s
+    ``Path(args.path)`` ever sees it (see the ``C:UsersJosue...`` failures
+    in ``tests/plugins/test_kanban_attachments.py``).
+
+    Users who genuinely need a literal backslash-space (``a\\ b``) inside an
+    argument can quote it (``"a\\ b"``); with escapes disabled an unquoted
+    ``a\\ b`` splits into two tokens, which is the accepted tradeoff —
+    mangled Windows paths are the far more common failure.
+    """
+    lex = shlex.shlex(rest, posix=True)
+    lex.escape = ""  # keep backslashes verbatim (Windows paths)
+    lex.whitespace_split = True
+    return list(lex)
+
+
 def run_slash(rest: str) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
@@ -3486,7 +3508,7 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
+    tokens = _split_slash_args(rest) if rest and rest.strip() else []
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

@@ -179,3 +179,67 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# /kanban lexer — Windows absolute paths must survive tokenization (t_60d3fa15)
+# ---------------------------------------------------------------------------
+#
+# POSIX shlex.split() treats every backslash as an escape, silently turning
+# `C:\Users\me\upload.txt` into `C:Usersmeupload.txt` before the attach
+# subcommand's Path() ever sees it. run_slash must keep backslashes verbatim
+# while preserving "..." / '...' grouping.
+
+
+def test_run_slash_preserves_windows_absolute_paths(kanban_home):
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="win-path lexer", assignee="tester")
+
+    src_dir = kanban_home / "uploads"
+    src_dir.mkdir()
+    src = src_dir / "upload.txt"
+    src.write_bytes(b"windows path body")
+
+    # Unquoted Windows abs path — the exact failure shape from the bug report.
+    out = kc.run_slash(f"attach {task_id} {src}")
+    assert "Attached" in out, out
+
+    with kb.connect() as conn:
+        atts = kb.list_attachments(conn, task_id)
+        assert len(atts) == 1
+        assert atts[0].filename == "upload.txt"
+        assert Path(atts[0].stored_path).read_bytes() == b"windows path body"
+
+
+def test_run_slash_lexer_windows_paths_and_quoting():
+    """Unit-level: _split_slash_args keeps backslashes and quote grouping."""
+    split = kc._split_slash_args
+
+    # Bare Windows abs path token: backslashes must survive verbatim.
+    assert split(r"attach t_x C:\Users\Josue\upload.txt") == [
+        "attach", "t_x", r"C:\Users\Josue\upload.txt",
+    ]
+
+    # Quoted path with spaces still groups into a single token, quotes
+    # stripped, backslashes preserved.
+    assert split('attach t_x "C:\\Program Files\\my file.txt"') == [
+        "attach", "t_x", r"C:\Program Files\my file.txt",
+    ]
+
+    # Single quotes group too.
+    assert split("comment t_x 'hello world'") == [
+        "comment", "t_x", "hello world",
+    ]
+
+    # Whitespace splitting on unquoted spaces.
+    assert split("list --json") == ["list", "--json"]
+
+    # Blank / empty input yields no tokens (bare /kanban help path).
+    assert split("") == []
+    assert split("   ") == []
+
+    # Unbalanced quotes still raise, same as shlex.split.
+    with pytest.raises(ValueError):
+        split('attach t_x "unbalanced')
+
+
