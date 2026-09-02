@@ -252,6 +252,81 @@ def test_store_attachment_bytes_roundtrip(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Evidence integrity — fabricated/truncated payloads must fail loudly
+# (fleet bug t_e5db5332, card t_a4c2395b)
+# ---------------------------------------------------------------------------
+
+
+def test_store_attachment_bytes_rejects_signature_mismatch(kanban_home):
+    """A .png whose magic bytes are a fabricated ISO-BMFF 'ftop' box (the
+    exact 17-byte fleet stub) must be rejected before any write, leaving
+    no row and no orphan blob."""
+    import pytest
+
+    stub = bytes.fromhex("0000001866746f70") + b"\x00" * 9
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        with pytest.raises(ValueError, match="(?i)signature"):
+            kb.store_attachment_bytes(
+                conn, task_id, "stub.png", stub, uploaded_by="tester"
+            )
+        assert kb.list_attachments(conn, task_id) == []
+        assert list(kb.task_attachments_dir(task_id).glob("stub*")) == []
+    finally:
+        conn.close()
+
+
+def test_store_attachment_bytes_rejects_truncated_write(kanban_home, monkeypatch):
+    """If the disk write itself silently truncates, the read-back
+    verification must catch it and fail (no silent corrupt stub)."""
+    import pytest
+
+    real_write = Path.write_bytes
+
+    def truncating_write(self, data):
+        real_write(self, data[: max(1, len(data) // 3)])
+        return len(data)
+
+    monkeypatch.setattr(Path, "write_bytes", truncating_write)
+
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        with pytest.raises(ValueError, match="(?i)verif|mismatch"):
+            kb.store_attachment_bytes(
+                conn, task_id, "doc.txt", b"some bytes" * 10,
+                uploaded_by="tester",
+            )
+        assert kb.list_attachments(conn, task_id) == []
+        assert list(kb.task_attachments_dir(task_id).glob("doc*")) == []
+    finally:
+        conn.close()
+
+
+def test_store_attachment_bytes_allows_unknown_signature_text(kanban_home):
+    """Unknown extensions/payloads (logs, csv, no extension) stay allowed —
+    the check is magic-vs-extension consistency for known binary formats,
+    not a whitelist."""
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        kb.store_attachment_bytes(
+            conn, task_id, "notes.log", b"2026-09-02 plain text line",
+            uploaded_by="tester",
+        )
+        kb.store_attachment_bytes(
+            conn, task_id, "run-output", b"opaque blob \x00\x01",
+            uploaded_by="tester",
+        )
+        atts = kb.list_attachments(conn, task_id)
+        assert [a.filename for a in atts] == ["notes.log", "run-output"]
+        assert Path(atts[0].stored_path).read_bytes() == b"2026-09-02 plain text line"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI — hermes kanban attach / attachments / attach-rm
 # ---------------------------------------------------------------------------
 
