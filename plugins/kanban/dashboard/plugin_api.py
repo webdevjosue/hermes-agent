@@ -418,10 +418,25 @@ async def upload_task_attachment(
         dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = _collision_free_path(dest_dir, safe_name)  # foo.pdf → foo (1).pdf …
+
+        # Evidence-integrity gate (fleet bug t_e5db5332): reject a known
+        # binary extension whose first bytes contradict that format's magic
+        # signature BEFORE writing anything to disk. Raises
+        # AttachmentSignatureError (a ValueError) → 400 via the handler
+        # below; a 0-byte upload under a known binary extension is corrupt
+        # by definition, same as the shared store path.
+        first_chunk = await file.read(1024 * 1024)
+        kanban_db._validate_attachment_head(safe_name, first_chunk[:16], len(first_chunk))
+
         total = 0  # stream in chunks with a hard size cap so one upload can't fill the disk
         try:
             with open(dest_path, "wb") as out:
-                while chunk := await file.read(1024 * 1024):
+                while True:
+                    chunk = first_chunk if total == 0 and first_chunk else None
+                    if chunk is None:
+                        chunk = await file.read(1024 * 1024)
+                        if not chunk:
+                            break
                     total += len(chunk)
                     if total > KANBAN_ATTACHMENT_MAX_BYTES:
                         out.close()
@@ -429,8 +444,27 @@ async def upload_task_attachment(
                         raise HTTPException(
                             status_code=413, detail=f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit")
                     out.write(chunk)
+                first_chunk = b""
+        except HTTPException:
+            raise
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+
+        # Read-back verification: the row's size must describe what actually
+        # landed on disk (fleet bug t_e5db5332 — never log success for a
+        # silently truncated blob).
+        on_disk = dest_path.stat().st_size
+        if on_disk != total:
+            dest_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"attachment write verification failed: streamed "
+                    f"{total} bytes but {on_disk} landed on disk — refusing "
+                    f"to record a truncated/corrupt attachment"
+                ),
+            )
+
         att_id = kanban_db.add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
             content_type=file.content_type, size=total, uploaded_by=(uploaded_by or "dashboard"))

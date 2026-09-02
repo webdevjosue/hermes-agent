@@ -296,7 +296,12 @@ KANBAN_ATTACH_SCHEMA = _schema(
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "kanban_attach_url when you only have a URL. IMPORTANT: the "
+        "payload's magic bytes are verified against the filename "
+        "extension and against what lands on disk — a base64 blob you "
+        "composed from memory (a truncated or fabricated file header) "
+        "will be REJECTED. Read the real file and base64-encode its "
+        "actual bytes, or use kanban_attach_url."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),

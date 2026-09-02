@@ -757,12 +757,30 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                 continue
             resp.raise_for_status()
             content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
+            content_length_hdr = resp.headers.get("content-length")
             for chunk in resp.iter_bytes(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
                     raise ValueError(f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit")
                 chunks.append(chunk)
-        return b"".join(chunks), content_type
+        data = b"".join(chunks)
+        # Evidence-integrity cross-check (card t_a4c2395b): a server (or a
+        # proxy) that truncates the body while declaring a larger
+        # Content-Length yields a silently corrupt attachment. Mismatch →
+        # loud failure; the caller can retry.
+        declared: Optional[int] = None
+        if content_length_hdr:
+            try:
+                declared = int(content_length_hdr.strip())
+            except ValueError:
+                declared = None
+        if declared is not None and declared != len(data):
+            raise ValueError(
+                f"Content-Length mismatch fetching {url}: header declared "
+                f"{declared} bytes but {len(data)} bytes were received — the "
+                f"transfer was truncated; refusing to store a partial file."
+            )
+        return data, content_type
     raise ValueError(f"too many redirects fetching {url}")
 
 
