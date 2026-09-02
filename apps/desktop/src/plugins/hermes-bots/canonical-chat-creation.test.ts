@@ -203,6 +203,30 @@ describe('the lazy row is materialized before anything else touches it', () => {
     )
   })
 
+  it('keeps the profile scope on a LOCAL bot — navigation, not a chrome-home switch', async () => {
+    // The old `route ? true : false` split passed keepAllProfilesScope:false
+    // for a local bot, which planPluginOpenSession turns into an explicit
+    // workspace switch: $activeGatewayProfile followed the bot (say 'video'),
+    // $profileScope followed $activeGatewayProfile, and the Sessions sidebar
+    // collapsed onto the bot's profile. Leaving Bot Mode never restored the
+    // launch profile, so the user read this as "dropped out of default" and
+    // had to click default to get back. A bot open must match
+    // openStoredBotChat: dial the bot's backend in the background, leave
+    // chrome where it is.
+    respondWith(method =>
+      method === 'session.create' ? { session_id: 'runtime-1', stored_session_id: 'stored-1' } : {}
+    )
+
+    const { createCanonicalChat } = await loadModule()
+
+    await createCanonicalChat('ops', { kickoff: true })
+
+    expect(hostMock.openSession).toHaveBeenCalledWith(
+      'stored-1',
+      expect.objectContaining({ keepAllProfilesScope: true })
+    )
+  })
+
   it('speaks the intro in the active locale (#91827)', async () => {
     // The first line of the forever-chat, and the bot's reply follows its
     // language — so a hardcoded English intro biased the whole conversation.
