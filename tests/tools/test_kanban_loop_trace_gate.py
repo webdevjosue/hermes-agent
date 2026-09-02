@@ -50,6 +50,15 @@ def worker_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    # Owner contract for the live-claim guard (run-263, t_7f85aa6f):
+    # pin the run id the claim created, same as the canonical
+    # worker_env in tests/tools/test_kanban_tools.py.
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
     return tid
 
 
