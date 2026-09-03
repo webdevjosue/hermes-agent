@@ -150,6 +150,127 @@ def _fallback_chain_phrase() -> str:
     )
 
 
+def _no_agent_failure_streak_alarm_level(job: dict) -> str:
+    """Loud-surface decision for a failing no_agent job: "escalate" | "quiet".
+
+    A no_agent job's failures surface only through per-run output files and a
+    ``cron list`` line — for ``deliver=local`` there is no message at all, so
+    a permanently broken script can fail forever without a single ping (the
+    77-failure streak in fleet bug t_d5cb7ff1, visible only in jobs.json).
+
+    Escalation threshold: ``cron.failure_streak_alarm_threshold`` (default 10,
+    ``0`` disables). Read BEFORE mark_job_run increments the streak for THIS
+    run, so "streak >= threshold" means "threshold runs have already failed
+    and this one makes it threshold+1".
+    """
+    if not job.get("no_agent"):
+        return "quiet"
+    schedule_kind = (job.get("schedule") or {}).get("kind")
+    if schedule_kind not in {"cron", "interval"}:
+        return "quiet"
+    try:
+        cfg = load_config() or {}
+        threshold = int(
+            ((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get(
+                "failure_streak_alarm_threshold", 10
+            )
+        )
+    except Exception:
+        threshold = 10
+    if threshold <= 0:
+        return "quiet"
+    streak = int(job.get("failure_streak") or 0)
+    return "escalate" if streak >= threshold else "quiet"
+
+
+def _deliver_failure_streak_alarm(
+    job: dict, *, streak: int, output: str, now_iso: str
+) -> None:
+    """Best-effort loud ping for a persistently failing no_agent job.
+
+    Sends through ``_deliver_result`` against a temporary escalation view of
+    the job (``deliver=all``) so the notice routes to every platform with a
+    configured home channel — the same expansion ``_expand_routing_tokens``
+    already performs. Bots that resolve nothing (no home channels anywhere)
+    simply no-op; the ERROR log from the caller remains the floor. Never
+    raises into the cron run: all failures are logged and swallowed.
+    """
+    import copy as _copy
+
+    escalation = _copy.deepcopy(job)
+    escalation["deliver"] = "all"
+    escalation["failure_deliver"] = "all"
+    job_name = job.get("name") or job.get("id") or "cron job"
+    content = (
+        f"🚨 Cron no-agent job '{job_name}' has failed {streak} runs in a row.\n\n"
+        f"Last error:\n{str(output)[:1500]}\n\n"
+        f"This alert fires once per failure streak; fix or pause the job with "
+        f"`hermes cron pause {job_name}`.\nTime: {now_iso}"
+    )
+    err = _deliver_result(escalation, content, for_failure=True)
+    if err:
+        logger.error(
+            "Job '%s': failure-streak alarm could not be delivered: %s",
+            job.get("id", "?"), err,
+        )
+
+
+def _find_cron_bash() -> Optional[str]:
+    """Resolve a bash that can execute Windows NTFS script paths, or None.
+
+    ``shutil.which("bash")`` on Windows can resolve ``C:\\Windows\\System32\\
+    bash.exe`` — the WSL launcher — whenever Git Bash is not earlier on the
+    process PATH (gateway-started processes, service contexts, an operator
+    shell without Git's bin prepended). The WSL launcher is a Linux bash: it
+    strips unquoted backslashes as shell escapes and cannot read NTFS paths
+    directly, so ``argv = [bash, "C:\\...\\job.sh"]`` dies with
+    ``/bin/bash: C:Users...job.sh: No such file or directory`` (exit 127) on
+    EVERY fire — the 77-failure streak in fleet bug t_d5cb7ff1.
+
+    This mirrors ``tools.environments.local._find_bash``'s ordering (env
+    override, then known Git-for-Windows layouts, then PATH) but stays cheap
+    and dependency-free for the cron tick path: no start probes, no caching
+    beyond one attribute, just explicit file checks that prefer interpreters
+    known to understand the very paths we pass them.
+    """
+    if os.name != "nt":
+        return shutil.which("bash") or (
+            "/bin/bash" if os.path.isfile("/bin/bash") else None
+        )
+
+    candidates: list[str] = []
+
+    custom = os.environ.get("HERMES_GIT_BASH_PATH")
+    if custom and os.path.isfile(custom):
+        candidates.append(custom)
+
+    for candidate in (
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "hermes", "git", "bin", "bash.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "hermes", "git", "usr", "bin", "bash.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "bin", "bash.exe"),
+    ):
+        if candidate and os.path.isfile(candidate) and candidate not in candidates:
+            candidates.append(candidate)
+
+    which_hit = shutil.which("bash")
+    # A which() hit under \Windows\System32 is the WSL launcher — it cannot
+    # execute NTFS-resident scripts as passed. Only keep it if no Git-for-
+    # Windows candidate exists AND it is genuinely usable (its argv[0] style
+    # path handling would still need wslpath translation, so treat System32
+    # bash as a miss entirely rather than a last resort that fails forever).
+    if (
+        which_hit
+        and which_hit not in candidates
+        and os.path.normcase(os.path.dirname(which_hit))
+        != os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows") + "\\System32")
+    ):
+        candidates.append(which_hit)
+
+    return candidates[0] if candidates else None
+
+
 def _failure_streak_nudge(job: dict) -> str:
     """Return a review nudge when a recurring job keeps failing, else "".
 
@@ -722,6 +843,7 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
+    mark_streak_alarm_alerted,
     save_job_output,
     use_cron_store,
 )
@@ -4562,14 +4684,13 @@ def _run_job_script(
         # shutil.which returns None — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        _bash = _find_cron_bash()
         if _bash is None:
             return False, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
-                "On Windows, install Git for Windows (which ships Git Bash) "
-                "or rewrite the script as Python (.py)."
+                f"Cannot run .sh/.bash script {path.name!r}: no Windows-compatible "
+                "bash found (looked for Git for Windows bash and HERMES_GIT_BASH_PATH). "
+                "Install Git for Windows (which ships Git Bash), or set "
+                "HERMES_GIT_BASH_PATH, or rewrite the script as Python (.py)."
         )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
@@ -5867,6 +5988,41 @@ def run_job(
                 f"{output}\n\n"
                 f"Time: {now_iso}"
             )
+            # Failure-streak alarm (fleet bug t_d5cb7ff1): once a recurring
+            # no_agent job has failed enough runs in a row, its per-run
+            # failure notice alone is not loud enough — for deliver=local
+            # jobs nothing ever leaves the process, and the streak grows
+            # invisibly in jobs.json. Escalate: ERROR log + a one-shot ping
+            # through the FAILURE lane (honours failure_deliver overrides),
+            # routed to the profile's home channels (all) so a local-only
+            # job still surfaces somewhere a human reads. The home-channel
+            # escalation is separate from the normal alert delivery so it
+            # fires even when the failure lane resolves to nothing.
+            _alarm_level = _no_agent_failure_streak_alarm_level(job)
+            _streak_count = int(job.get("failure_streak") or 0)
+            if _alarm_level == "escalate":
+                logger.error(
+                    "Job '%s' (no_agent): failure_streak=%d — script has "
+                    "failed %d runs in a row, escalating to home channels",
+                    job_id, _streak_count, _streak_count,
+                )
+                try:
+                    _already = mark_streak_alarm_alerted(job_id)
+                except Exception:
+                    _already = False
+                if not _already:
+                    try:
+                        _deliver_failure_streak_alarm(
+                            job,
+                            streak=_streak_count,
+                            output=output,
+                            now_iso=now_iso,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Job '%s': failure-streak alarm delivery raised",
+                            job_id,
+                        )
             doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"

@@ -3085,6 +3085,23 @@ def _set_preflight_alerted(job_id: str, value: bool) -> bool:
     return _set_alert_flag(job_id, "preflight_alerted", value)
 
 
+def mark_streak_alarm_alerted(job_id: str) -> bool:
+    """Mark the failure-streak alarm as sent; return True if it already was.
+
+    Alert-once dedup for the no_agent failure-streak alarm (t_d5cb7ff1): the
+    escalation ping fires on the first run whose streak crosses the threshold
+    and stays silent for the rest of that streak — the per-run failure notice
+    (when the job delivers one) already covers subsequent runs. Cleared by
+    ``mark_job_run`` on any successful run, like the other alert markers.
+    """
+    return _set_alert_flag(job_id, "streak_alarm_alerted", True)
+
+
+def clear_streak_alarm_alerted(job_id: str) -> None:
+    """Clear the failure-streak alarm marker (new failure streak may re-alert)."""
+    _set_alert_flag(job_id, "streak_alarm_alerted", False)
+
+
 def mark_preflight_alerted(job_id: str) -> bool:
     """Mark the job as preflight-alerted; return True if it already was."""
     return _set_preflight_alerted(job_id, True)
@@ -3210,6 +3227,9 @@ def _mark_job_run_locked(
                 if success:
                     job.pop("preflight_alerted", None)
                     job.pop("drift_alerted", None)
+                    # A healthy run starts a fresh failure streak — allow a
+                    # future streak to re-escalate (alert-once per streak).
+                    job.pop("streak_alarm_alerted", None)
                     # The fire hand-off demonstrably works again — clear the
                     # forward-failure stamp so it only ever describes the
                     # CURRENT auto-fire health, not a healed past incident.

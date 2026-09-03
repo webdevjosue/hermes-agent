@@ -681,6 +681,13 @@ def _script_health_issue(script: str) -> Optional[str]:
 # (ticker dead, gateway down, or a wedged fire-claim).
 _OVERDUE_GRACE_SECONDS = 15 * 60
 
+# Consecutive failures before `hermes cron doctor` reports the streak as an
+# issue. Mirrors cron/scheduler.py's escalation threshold
+# (cron.failure_streak_alarm_threshold, default 10) but is deliberately a CLI
+# display constant: doctor is a read-only sweep and must not grow config
+# plumbing of its own.
+_STREAK_ALARM_THRESHOLD = 10
+
 
 def _next_run_overdue_issue(next_run: str) -> Optional[str]:
     """Return an issue string when ``next_run_at`` is parked in the past."""
@@ -741,6 +748,17 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     workdir = str(job.get("workdir") or "").strip()
     if workdir and not Path(workdir).expanduser().exists():
         issues.append(f"workdir not found: {workdir}")
+
+    # Consecutive-failure escalation (t_d5cb7ff1): a job can fail every run
+    # for days with the only trace in per-run output files. `cron list` shows
+    # the streak for the job you already suspect; doctor is the sweep that
+    # finds it across the whole table.
+    streak = int(job.get("failure_streak") or 0)
+    if streak >= _STREAK_ALARM_THRESHOLD:
+        issues.append(
+            f"failure_streak={streak}: job has failed {streak} runs in a row — "
+            f"fix it or pause it (`hermes cron pause <job>`)"
+        )
 
     return issues
 
