@@ -150,6 +150,7 @@ def _make_update_side_effect(
     update_ref_fails=False,
     pre_pull_sha_unavailable=False,
     existing_rescue_refs=None,
+    ahead_count="0",
 ):
     """Build a subprocess.run side_effect for cmd_update tests.
 
@@ -170,6 +171,13 @@ def _make_update_side_effect(
     ``existing_rescue_refs`` simulates the refs already present under
     ``refs/hermes-update-backups/orphan-<branch>-*`` (oldest first) so the
     ``_prune_orphan_rescue_refs`` cleanup pass has something to trim.
+
+    ``ahead_count`` controls the refuse-to-wipe guard's
+    ``git rev-list --count origin/<branch>..HEAD`` probe (2026-09-01/09-02
+    incidents): "0" (default) means local HEAD holds nothing origin lacks
+    (true upstream force-push — reset is safe), a positive count means
+    unpushed local commits exist (update must abort, never reset), and None
+    makes the probe fail outright (unparseable output — must also abort).
     """
     recorded = []
     head_sha_calls = []
@@ -202,6 +210,17 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
+            # Refuse-to-wipe ahead-probe (origin/<branch>..HEAD) is distinct
+            # from the behind-count (HEAD..origin/<branch>): unpushed local
+            # commits must abort the update, not be reset away.
+            if "origin/" in joined and "..HEAD" in joined and "--count" in joined:
+                if ahead_count is None:
+                    return SimpleNamespace(
+                        stdout="garbage", stderr="", returncode=0
+                    )
+                return SimpleNamespace(
+                    stdout=f"{ahead_count}\n", stderr="", returncode=0
+                )
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "merge-base" in joined:
             if merge_base_exists:
@@ -439,6 +458,105 @@ def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, 
     out = capsys.readouterr().out
     assert "orphan divergence" not in out
     assert "Fast-forward not possible (history diverged), resetting to match remote" in out
+
+
+# ---------------------------------------------------------------------------
+# Refuse-to-wipe guard (2026-09-01 & 2026-09-02 incidents): same-branch
+# divergence with unpushed local commits must abort, never `reset --hard`.
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_update_ahead_commits_abort_instead_of_reset(monkeypatch, tmp_path, capsys):
+    """ff-only fails, common ancestor exists, and HEAD is ahead of
+    origin/<branch> by 2 commits (unpushed local work + upstream moved) —
+    the exact 2x-in-18h wipe shape. The update must abort loudly, park the
+    HEAD behind an ahead-* rescue ref, and NEVER run `reset --hard`."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=True, ahead_count="2",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    # No hard reset to the remote may run — that is the wipe.
+    reset_calls = [
+        c for c in recorded
+        if "reset" in " ".join(str(x) for x in c) and "--hard" in c
+    ]
+    assert reset_calls == [], "refuse-to-wipe violated: reset --hard ran"
+
+    # The pre-wipe HEAD must be parked behind an ahead-* rescue ref.
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert len(update_ref_calls) == 1
+    ref_name = update_ref_calls[0][update_ref_calls[0].index("update-ref") + 1]
+    assert ref_name.startswith("refs/hermes-update-backups/ahead-main-")
+    # Parked at the pre-pull SHA, carrying it in the name for uniqueness.
+    assert update_ref_calls[0][-1] == "1111111111111111111111111111111111111beef"
+    assert ref_name.endswith("-111111111111")
+
+    out = capsys.readouterr().out
+    assert "refusing to wipe unpushed local commits" in out
+    assert "2 commit(s) ahead" in out
+    assert ref_name in out
+    assert "resetting to match remote" not in out
+
+
+def test_cmd_update_unparseable_ahead_probe_aborts(monkeypatch, tmp_path, capsys):
+    """Ahead-count probe returns garbage — cannot prove HEAD is not ahead, so
+    the update must refuse (fail-closed) rather than reset on faith."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=True, ahead_count=None,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    reset_calls = [
+        c for c in recorded
+        if "reset" in " ".join(str(x) for x in c) and "--hard" in c
+    ]
+    assert reset_calls == []
+
+    out = capsys.readouterr().out
+    assert "refusing to wipe unpushed local commits" in out
+    assert "Could not verify" in out
+
+
+def test_cmd_update_not_ahead_force_push_still_resets(monkeypatch, tmp_path, capsys):
+    """ahead_count=0 (proven no local-only commits) — a true upstream
+    force-push/rebase. The historical reset-to-remote behavior must be
+    preserved: the guard may not turn every divergence into an abort."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=True, ahead_count="0",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    # The git phase is what's under test; the dependency-sync tail can hit
+    # Windows shim/gateway-restart contention when run from inside a live
+    # Hermes (the same environmental failure that befalls the pre-existing
+    # divergence tests on this box). Swallow even SystemExit from the tail —
+    # the assertions below are on the recorded git calls, and a wrongly-
+    # aborting guard leaves `reset_calls` empty, failing regardless.
+    try:
+        hermes_main.cmd_update(SimpleNamespace())
+    except BaseException:
+        pass
+
+    reset_calls = [
+        c for c in recorded
+        if "reset" in " ".join(str(x) for x in c) and "--hard" in c
+    ]
+    assert any("origin/main" in " ".join(str(x) for x in c) for c in reset_calls)
+    out = capsys.readouterr().out
+    assert "refusing to wipe" not in out
 
 
 def test_cmd_update_orphan_rescue_ref_write_failure_is_non_fatal(monkeypatch, tmp_path, capsys):

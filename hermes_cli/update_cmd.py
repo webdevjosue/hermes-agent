@@ -9147,11 +9147,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    #
-                    # Divergence here comes in two shapes: ordinary (a common
+                    # Same branch as the update target. Local changes are
+                    # already stashed. Divergence comes in two shapes:
+                    # ordinary (a common
                     # ancestor still exists — the reset below is a normal,
                     # safe re-sync onto the remote) and orphan (no common
                     # ancestor at all, e.g. a corrupted local HEAD or a repo
@@ -9208,6 +9206,91 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 f"(pre-reset SHA was {pre_pull_sha})."
                             )
                         _prune_orphan_rescue_refs(git_cmd, _m().PROJECT_ROOT, branch)
+                    if has_common_ancestor:
+                        # Refuse-to-wipe guard (incidents 2026-09-01 &
+                        # 2026-09-02: `hermes update` ran `reset --hard
+                        # origin/main` on this exact path and silently
+                        # discarded unpushed local commits, twice in 18h).
+                        # Ordinary divergence is NOT proof of an upstream
+                        # force-push: HEAD may hold commits origin/<branch>
+                        # lacks (unpushed local work) while upstream also
+                        # moved. If HEAD is ahead by even one commit — or
+                        # aheadness cannot be proven — park the commits
+                        # behind a rescue ref and abort loudly. An update
+                        # must never destroy unpushed commits.
+                        ahead_probe = subprocess.run(
+                            git_cmd + [
+                                "rev-list", "--count", f"origin/{branch}..HEAD",
+                            ],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        ahead_count = None
+                        if ahead_probe.returncode == 0:
+                            try:
+                                ahead_count = int(ahead_probe.stdout.strip() or "0")
+                            except ValueError:
+                                ahead_count = None
+                        if ahead_count is None or ahead_count > 0:
+                            from datetime import datetime as _dt, timezone
+
+                            rescue_ref = (
+                                f"refs/hermes-update-backups/ahead-{branch}-"
+                                f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-"
+                                f"{(pre_pull_sha or 'HEAD')[:12]}"
+                            )
+                            park_result = subprocess.run(
+                                git_cmd + [
+                                    "update-ref", rescue_ref,
+                                    pre_pull_sha or "HEAD",
+                                ],
+                                cwd=_m().PROJECT_ROOT,
+                                capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                            )
+                            print()
+                            print(
+                                "✗ Update aborted: refusing to wipe unpushed local commits."
+                            )
+                            if ahead_count:
+                                print(
+                                    f"  Local HEAD is {ahead_count} commit(s) ahead "
+                                    f"of origin/{branch} (history diverged) — a "
+                                    f"hard reset here would destroy them."
+                                )
+                            else:
+                                print(
+                                    f"  Could not verify whether HEAD is ahead of "
+                                    f"origin/{branch} — refusing to reset as a "
+                                    f"precaution."
+                                )
+                            if park_result.returncode == 0:
+                                print(
+                                    f"  Current HEAD parked at rescue ref: "
+                                    f"{rescue_ref}"
+                                )
+                            elif pre_pull_sha:
+                                print(
+                                    f"  Rescue-ref write failed — recover manually "
+                                    f"from HEAD SHA: {pre_pull_sha}"
+                                )
+                            print("  To reconcile manually and update anyway:")
+                            print(f"    cd {_m().PROJECT_ROOT}")
+                            print(
+                                f"    git log --oneline origin/{branch}..HEAD"
+                                "    # your unpushed commits"
+                            )
+                            print(
+                                "    git push <your-remote> main"
+                                "               # publish them, or"
+                            )
+                            print(
+                                f"    git merge origin/{branch}"
+                                "                 # merge upstream yourself"
+                            )
+                            print("  Then re-run: hermes update")
+                            sys.exit(1)
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
