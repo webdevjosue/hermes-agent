@@ -234,9 +234,18 @@ class WebhookRouteProcessor:
 
         suffix = path.suffix.lower()
         if suffix in {".sh", ".bash"}:
-            bash = shutil.which("bash") or (
-                "/bin/bash" if os.path.isfile("/bin/bash") else None
-            )
+            # Same Windows defect class as cron's _run_job_script (t_d5cb7ff1):
+            # bare shutil.which("bash") can resolve the WSL launcher
+            # (C:\Windows\System32\bash.exe) when Git Bash is not on the
+            # process PATH, and WSL bash strips unquoted backslashes — an
+            # NTFS script path becomes C:Users... and every call exits 127.
+            # Reuse the terminal lane's canonical Windows-aware resolver.
+            from tools.environments.local import _find_bash
+
+            try:
+                bash = _find_bash()
+            except Exception:
+                bash = None
             if bash is None:
                 logger.warning("[webhook] script ignored webhook: bash not found")
                 return False, None
