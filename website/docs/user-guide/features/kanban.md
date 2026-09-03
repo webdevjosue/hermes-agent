@@ -860,7 +860,7 @@ Every `hermes kanban <action>` verb is also reachable as `/kanban <action>` — 
 /kanban specify --all --tenant engineering  # sweep every triage task in one tenant
 ```
 
-Quote multi-word arguments the same way you would on a shell — `run_slash` parses the rest of the line with `shlex.split`, so `"..."` and `'...'` both work.
+Quote multi-word arguments the same way you would on a shell — `run_slash` parses the rest of the line with `shlex.split` semantics, so `"..."` and `'...'` both work. Backslashes are kept verbatim (not treated as escapes), so Windows absolute paths like `C:\Users\me\file.txt` work unquoted.
 
 ### Mid-run usage: `/kanban` bypasses the running-agent guard
 

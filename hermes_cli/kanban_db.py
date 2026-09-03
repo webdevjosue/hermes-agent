@@ -1363,6 +1363,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
+    -- REAL progress timestamps (progress-flagged heartbeats: new tool
+    -- name/args, non-empty assistant text, explicit kanban_heartbeat).
+    -- Distinguished from last_heartbeat_at because the run-244 wedge
+    -- (t_3df0dd33) showed passive stream/wait ticks keeping the heartbeat
+    -- alive for hours while zero actual progress happened.
+    last_progress_at     INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
@@ -2608,6 +2614,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
+        )
+    if "last_progress_at" not in cols:
+        # Run-244 wedge (t_3df0dd33): REAL progress timestamps (progress-
+        # flagged heartbeats) vs raw liveness. NULL until the worker's
+        # first progress heartbeat; detect_progress_stalled treats NULL as
+        # "not enough signal" and leaves the task alone.
+        _add_column_if_missing(
+            conn, "tasks", "last_progress_at", "last_progress_at INTEGER"
         )
     if "current_run_id" not in cols:
         _add_column_if_missing(
@@ -4078,6 +4092,98 @@ class AttachmentTooLarge(ValueError):
     """
 
 
+class AttachmentSignatureError(ValueError):
+    """Raised when a payload's magic bytes contradict its filename extension.
+
+    Fleet bug (2026-09-01, card t_e5db5332): ``kanban_attach`` stored a
+    17-byte fabricated stub (``00000018 66746f70`` + zeros — an invented
+    ISO-BMFF box with no major brand) as ``remotion-smoke-frame.png`` and
+    reported SUCCESS, because the write path trusted the payload blindly.
+    Board-wide forensics found six such stubs — every one a tiny prefix of
+    plausible-looking bytes ("HTTP/1.1 200", "import http.", ``{"ladder_fai``)
+    that a model produced from memory instead of reading the real file.
+
+    The check is *consistency*, not a whitelist: unknown extensions and
+    plain-text payloads always pass; a known binary extension whose payload
+    doesn't start with that format's magic bytes fails loudly.
+    """
+
+
+class AttachmentVerificationError(ValueError):
+    """Raised when bytes read back from disk differ from the payload written.
+
+    Catches a silently truncating/corrupting storage layer (disk pressure,
+    AV interference, a broken transport shim) before a success event is
+    logged — the stored blob is removed and no metadata row is created.
+    """
+
+
+# Magic-byte rules for well-known binary formats. Each entry maps a set of
+# filename extensions to a (predicate, expected-description) pair evaluated
+# against the head of the payload. Extensions not listed here are unchecked.
+_SIG_PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def _is_iso_bmff_ftyp(head: bytes) -> bool:
+    return len(head) >= 12 and head[4:8] == b"ftyp" and all(
+        0x20 <= b <= 0x7E for b in head[8:12]
+    )
+
+
+_ATTACHMENT_SIGNATURE_RULES: tuple = (
+    # (extensions, predicate, expected)
+    (("png",), lambda h: h.startswith(_SIG_PNG), "PNG signature 89 50 4E 47 0D 0A 1A 0A"),
+    (("jpg", "jpeg"), lambda h: h.startswith(b"\xff\xd8\xff"), "JPEG signature FF D8 FF"),
+    (("gif",), lambda h: h[:6] in (b"GIF87a", b"GIF89a"), "GIF header GIF87a/GIF89a"),
+    (("pdf",), lambda h: h.startswith(b"%PDF-"), "PDF header %PDF-"),
+    (("mp4", "m4v", "mov"), _is_iso_bmff_ftyp, "ISO-BMFF ftyp box with a printable major brand"),
+    (("webm", "mkv"), lambda h: h.startswith(b"\x1a\x45\xdf\xa3"), "EBML header 1A 45 DF A3"),
+    (("wav",), lambda h: h[:4] == b"RIFF" and h[8:12] == b"WAVE", "RIFF/WAVE header"),
+    (("avi",), lambda h: h[:4] == b"RIFF" and h[8:12] == b"AVI ", "RIFF/AVI header"),
+    (("webp",), lambda h: h[:4] == b"RIFF" and h[8:12] == b"WEBP", "RIFF/WEBP header"),
+    (
+        ("zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "whl", "apk"),
+        lambda h: h[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+        "ZIP local-file signature PK",
+    ),
+    (("rar",), lambda h: h.startswith(b"Rar!\x1a\x07"), "RAR signature Rar!"),
+    (("7z",), lambda h: h.startswith(b"7z\xbc\xaf\x27\x1c"), "7z signature"),
+    (("gz",), lambda h: h.startswith(b"\x1f\x8b"), "gzip signature 1F 8B"),
+    (("bz2",), lambda h: h.startswith(b"BZh"), "bzip2 signature BZh"),
+    (("xz",), lambda h: h.startswith(b"\xfd7zXZ\x00"), "xz signature FD 37 7A 58 5A 00"),
+)
+
+
+def _validate_attachment_payload(name: str, data: bytes) -> None:
+    """Reject payloads whose bytes contradict a known binary extension.
+
+    Raises :class:`AttachmentSignatureError` (nothing has been written yet)
+    with a message that tells the caller how to recover: re-acquire the real
+    bytes and retry. Zero-byte payloads under a known binary extension are
+    rejected too — an empty ``.png`` is corrupt by definition.
+    """
+    _validate_attachment_head(name, data[:16], len(data))
+
+
+def _validate_attachment_head(name: str, head: bytes, size: int) -> None:
+    """Signature check on the payload head; shared by the byte-buffered
+    store path (:func:`_validate_attachment_payload`) and the dashboard's
+    streaming upload route, which only holds the head + total size."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    for exts, predicate, expected in _ATTACHMENT_SIGNATURE_RULES:
+        if ext in exts:
+            if size == 0 or not predicate(head):
+                raise AttachmentSignatureError(
+                    f"attachment signature mismatch for '{name}': expected "
+                    f"{expected}, got {head.hex()!r} "
+                    f"({size} bytes) — the payload is truncated, "
+                    f"fabricated, or not a real {ext.upper()} file. Refusing "
+                    f"to store corrupt evidence. Re-read the real file bytes "
+                    f"and retry with the complete payload."
+                )
+            return
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -4148,11 +4254,33 @@ def store_attachment_bytes(
         raise AttachmentTooLarge(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
+    # Evidence-integrity gate (fleet bug t_e5db5332): reject a payload whose
+    # magic bytes contradict a known binary extension BEFORE anything is
+    # written. A 17-byte fabricated 'ftop' stub named ".png" must never
+    # reach the board as a success event.
+    _validate_attachment_payload(filename, data)
     safe_name = _safe_attachment_name(filename)
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
+    # Read-back verification: the metadata row's size must describe the
+    # bytes actually on disk, not the payload we *think* we wrote. A silent
+    # truncating write layer is a corrupt-evidence seed; fail loudly and
+    # leave no row behind.
+    stored = dest_path.stat().st_size
+    if stored != len(data):
+        try:
+            dest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise AttachmentVerificationError(
+            f"attachment write verification failed for '{dest_path.name}': "
+            f"payload was {len(data)} bytes but {stored} bytes landed on "
+            f"disk — refusing to record a success for a truncated/corrupt "
+            f"blob. Retry the attach; if it persists, investigate the "
+            f"storage layer."
+        )
     try:
         return add_attachment(
             conn,
@@ -5356,6 +5484,18 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ClaimOwnershipError(RuntimeError):
+    """A terminal transition was attempted on a live claim this caller
+    does not own (no matching ``expected_run_id``, no ``force=True``).
+
+    Raised by :func:`complete_task` before any mutation. Registry-level
+    twin of the M1 guard in :func:`request_review`. Root cause: run-263
+    incident (card t_7f85aa6f) — an interactive session with no
+    dispatcher env completed a dispatcher-spawned worker's card
+    mid-run, hijacking the run row's attribution.
+    """
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5369,6 +5509,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    force: bool = False,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5408,6 +5549,51 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    # Live-claim ownership gate (run-263 incident, card t_7f85aa6f):
+    # an unaffiliated caller (e.g. an interactive session with no
+    # dispatcher env) must not complete — and thereby clear the claim of
+    # and hijack attribution on — a run belonging to a live worker.
+    # Mirrors the M1 guard in ``request_review``: prove ownership via
+    # ``expected_run_id`` or explicitly override with ``force=True``
+    # (human/CLI/dashboard). Same two-phase shape as the hallucination
+    # gate below: auditable refusal event in a tiny dedicated txn, then
+    # raise BEFORE any task-state mutation; re-checked CAS-style inside
+    # the main txn to close the claim race.
+    if expected_run_id is None and not force:
+        _live = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            _live is not None
+            and _live["status"] == "running"
+            and (
+                _live["claim_lock"] is not None
+                or _live["current_run_id"] is not None
+            )
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_refused_claim_ownership",
+                    {
+                        "reason": "live_claim_not_owned",
+                        "claim_lock": _live["claim_lock"],
+                        "current_run_id": _live["current_run_id"],
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise ClaimOwnershipError(
+                f"task {task_id} is running under a live claim "
+                f"(lock={_live['claim_lock']!r}, "
+                f"run={_live['current_run_id']}); complete refused. "
+                f"Pass expected_run_id (worker ownership) or "
+                f"force=True (explicit operator override)."
+            )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5450,6 +5636,25 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Live-claim ownership re-check inside the main txn (closes the
+        # claim race the pre-txn gate can't see; see run-263 guard).
+        if (
+            expected_run_id is None
+            and not force
+            and prior_status == "running"
+        ):
+            live = conn.execute(
+                "SELECT claim_lock, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if live is not None and (
+                live["claim_lock"] is not None
+                or live["current_run_id"] is not None
+            ):
+                raise ClaimOwnershipError(
+                    f"task {task_id} was claimed mid-flight; complete "
+                    f"refused (pass expected_run_id or force=True)."
+                )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -8069,6 +8274,11 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    progress_stalled: list[str] = field(default_factory=list)
+    """Task ids reclaimed because their heartbeat stayed alive while real
+    progress (``last_progress_at``) went stale beyond
+    ``kanban.progress_watchdog.progress_stale_seconds`` — the run-244
+    wedge signature (t_3df0dd33)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -8100,12 +8310,48 @@ class DispatchResult:
 # ``detect_crashed_workers`` to classify a dead-pid task.
 #
 # Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``. We keep raw status
-# so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
-# be consulted. Entries are trimmed by age (and total size cap as a
-# belt-and-braces against unbounded growth on exotic platforms).
+# so the wait-status decoders below (``_wifexited`` / ``_wexitstatus`` /
+# ``_wifsignaled`` / ``_wtermsig``) can be consulted. Entries are trimmed by
+# age (and total size cap as a belt-and-braces against unbounded growth on
+# exotic platforms).
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+
+
+# ---------------------------------------------------------------------------
+# Wait-status decoding without the POSIX-only ``os`` macros.
+#
+# ``os.WIFEXITED`` / ``os.WEXITSTATUS`` / ``os.WIFSIGNALED`` / ``os.WTERMSIG``
+# do not exist on Windows CPython, so a macro-based classifier silently
+# degraded every recorded exit to ``unknown`` there (the ``AttributeError``
+# was swallowed) — a clean rc=0 exit (protocol violation) and the
+# rate-limit sentinel were both accounted as plain crashes, tripping the
+# unified failure breaker on the first violation. The POSIX wait-status
+# layout is a fixed encoding, so decode it explicitly: identical results on
+# every platform, no dependency on which macros the local ``os`` module
+# happens to export.
+# ---------------------------------------------------------------------------
+
+def _wifexited(raw: int) -> bool:
+    """``True`` when the wait status encodes a normal exit (no signal bits)."""
+    return (raw & 0x7F) == 0
+
+
+def _wexitstatus(raw: int) -> int:
+    """Exit code byte of a normal-exit wait status (``code << 8``)."""
+    return (raw >> 8) & 0xFF
+
+
+def _wifsignaled(raw: int) -> bool:
+    """``True`` when the wait status encodes death by signal."""
+    low = raw & 0x7F
+    return 0 < low < 0x7F
+
+
+def _wtermsig(raw: int) -> int:
+    """Signal number of a killed-by-signal wait status."""
+    return raw & 0x7F
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -8160,15 +8406,20 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         return ("unknown", None)
     raw, _ = entry
     try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
+        # POSIX wait-status layout, decoded explicitly (see _wifexited):
+        # os.WIFEXITED & co. don't exist on Windows CPython, and the old
+        # macro-based lookup silently classified every exit as "unknown"
+        # there — clean exits and rate-limit bailouts both counted as
+        # crashes against the unified failure breaker.
+        if _wifexited(raw):
+            code = _wexitstatus(raw)
             if code == 0:
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
             return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
+        if _wifsignaled(raw):
+            return ("signaled", _wtermsig(raw))
     except Exception:
         pass
     return ("unknown", None)
@@ -8386,6 +8637,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    progress: bool = False,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -8393,6 +8645,15 @@ def heartbeat_worker(
     the PID check. A worker that forks a long-lived child (train loop,
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
+
+    ``progress=True`` marks this heartbeat as REAL forward progress (new
+    tool call, new args, non-empty assistant text, or the explicit
+    ``kanban_heartbeat`` tool) and additionally stamps the durable
+    ``last_progress_at`` column. The dispatcher's progress watchdog
+    (``detect_progress_stalled``) distinguishes "heartbeat alive but
+    nothing changing" (the run-244 wedge signature, t_3df0dd33) from a
+    healthy worker via this column. Default False keeps the passive
+    liveness-only semantics of every pre-existing caller.
 
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
@@ -8413,6 +8674,17 @@ def heartbeat_worker(
             )
         if cur.rowcount != 1:
             return False
+        if progress:
+            try:
+                conn.execute(
+                    "UPDATE tasks SET last_progress_at = ? WHERE id = ?",
+                    (now, task_id),
+                )
+            except sqlite3.OperationalError:
+                # Legacy board without the column (pre-migration): the
+                # heartbeat itself already succeeded; progress stamping is
+                # best-effort and must not fail the call.
+                pass
         run_id = (
             int(expected_run_id)
             if expected_run_id is not None
@@ -8425,7 +8697,9 @@ def heartbeat_worker(
             )
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            ({"note": note} if note else None) or (
+                {"progress": True} if progress else None
+            ),
             run_id=run_id,
         )
     return True
@@ -8507,7 +8781,7 @@ def enforce_max_runtime(
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (retry_status, tid, pid, row["claim_lock"]),
@@ -8638,7 +8912,7 @@ def detect_stale_running(
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
                 (retry_status, tid, row["claim_lock"]),
@@ -8684,6 +8958,150 @@ def detect_stale_running(
         # event already lives in task_events for auditability; that's the
         # right surface for "this happened" without conflating with the
         # spawn_failed / timed_out / crashed counters.
+
+    return reclaimed
+
+
+# Progress-staleness watchdog (run-244 wedge, t_3df0dd33): conservative
+# defaults, config-gated via kanban.progress_watchdog.* (default OFF).
+DEFAULT_PROGRESS_STALE_SECONDS = 1800
+DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS = 600
+
+
+def detect_progress_stalled(
+    conn: sqlite3.Connection,
+    *,
+    progress_stale_seconds: int = 0,
+    min_runtime_seconds: int = DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
+    signal_fn=None,
+) -> list[str]:
+    """Reclaim ``running`` tasks whose heartbeat is ALIVE but whose progress
+    is stale (run-244 wedge class).
+
+    Complements ``detect_stale_running`` (which needs a 1h heartbeat GAP)
+    with a divergence signal: ``last_heartbeat_at`` fresh (the auto
+    heartbeat bridge / worker still ticking) while ``last_progress_at``
+    (progress-flagged heartbeats only) is older than
+    ``progress_stale_seconds``. In the run-244 incident the wedge polled a
+    hung process with identical ``process(action="wait")`` calls for ~4h —
+    byte-identical except timeout drift — so passive heartbeats masked the
+    stall. With the progress-gated bridge (half 1) identical re-issues stop
+    counting as progress and this check reclaims within minutes of the
+    threshold.
+
+    Conservative by design:
+
+    - ``progress_stale_seconds=0`` (default / config disabled) -> no-op.
+    - NULL ``last_progress_at`` (worker never reported progress — pre-half-1
+      workers, or a long single tool call before any progress signal) is
+      NOT flagged; the heartbeat-gap checks own that case. This keeps the
+      check additive: no false reclaims of slow-but-healthy workers.
+    - Tasks younger than ``min_runtime_seconds`` are skipped.
+    - Reclaim follows the same path as ``detect_stale_running``: terminate
+      host-local worker, defer if it survives, restore source phase, close
+      run with ``outcome='progress_stalled'``, no failure counter.
+
+    Returns the list of reclaimed task ids.
+    """
+    if progress_stale_seconds <= 0:
+        return []
+
+    # Fail-open on legacy boards without the column (DROPped in tests too).
+    try:
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        return []
+    if "last_progress_at" not in cols:
+        return []
+
+    now = int(time.time())
+    reclaimed: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.last_progress_at, "
+        "       t.claim_lock, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running'"
+    ).fetchall()
+
+    for row in rows:
+        if row["active_started_at"] is None:
+            continue
+        elapsed = now - int(row["active_started_at"])
+        if elapsed < min_runtime_seconds:
+            continue
+
+        last_hb = row["last_heartbeat_at"]
+        last_prog = row["last_progress_at"]
+        if last_hb is None or last_prog is None:
+            continue  # not enough signal; heartbeat-gap checks own NULLs
+        hb_age = now - int(last_hb)
+        prog_age = now - int(last_prog)
+        # Divergence signature: heartbeat alive, progress stale.
+        if hb_age >= _STALE_HEARTBEAT_GAP_SECONDS:
+            continue  # detect_stale_running already owns this task
+        if prog_age < progress_stale_seconds:
+            continue
+
+        pid = row["worker_pid"]
+        tid = row["id"]
+        lock = row["claim_lock"] or ""
+
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="progress_stalled_worker_alive",
+            )
+            continue
+
+        with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, tid)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND claim_lock IS ?",
+                (retry_status, tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+
+            payload = {
+                "reason": "progress_stalled",
+                "elapsed_seconds": int(elapsed),
+                "last_heartbeat_at": int(last_hb),
+                "heartbeat_age_seconds": int(hb_age),
+                "last_progress_at": int(last_prog),
+                "progress_age_seconds": int(prog_age),
+                "progress_stale_seconds": int(progress_stale_seconds),
+                "pid": int(pid) if pid else None,
+                "retry_status": retry_status,
+            }
+            payload.update(termination)
+
+            run_id = _end_run(
+                conn, tid,
+                outcome="progress_stalled", status="progress_stalled",
+                error=(
+                    f"no progress for {int(prog_age)}s while heartbeats "
+                    f"stayed fresh (last {int(hb_age)}s ago) after "
+                    f"{int(elapsed)}s running"
+                ),
+                metadata=payload,
+            )
+            _append_event(
+                conn, tid, "progress_stalled", payload, run_id=run_id,
+            )
+            reclaimed.append(tid)
 
     return reclaimed
 
@@ -8734,7 +9152,7 @@ def reconcile_orphaned_running(
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_progress_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
                 (tid, row["claim_lock"], row["claim_expires"]),
@@ -9830,6 +10248,8 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    progress_stale_seconds: int = 0,
+    progress_min_runtime_seconds: int = DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9865,6 +10285,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            progress_stale_seconds=progress_stale_seconds,
+            progress_min_runtime_seconds=progress_min_runtime_seconds,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9885,6 +10307,8 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                progress_stale_seconds=progress_stale_seconds,
+                progress_min_runtime_seconds=progress_min_runtime_seconds,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9912,6 +10336,8 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    progress_stale_seconds: int = 0,
+    progress_min_runtime_seconds: int = DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9961,6 +10387,15 @@ def _dispatch_once_locked(
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
+    )
+    # Progress-staleness watchdog (run-244 wedge class): reclaims running
+    # tasks whose heartbeat cadence is alive but whose real progress
+    # (last_progress_at) went stale. Additive + config-gated; a 0/absent
+    # threshold is a no-op (see detect_progress_stalled).
+    result.progress_stalled = detect_progress_stalled(
+        conn,
+        progress_stale_seconds=progress_stale_seconds,
+        min_runtime_seconds=progress_min_runtime_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on

@@ -153,6 +153,23 @@ DEFAULT_CONFIG = {
         },
         # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first
         # fast_auto_seconds of every turn), "cold" (first turn of a session only).
+        # Near-identical tool-call repetition watchdog (run-244 wedge
+        # class). A live model wedged re-issuing the same call (observed:
+        # process(wait) x76 over ~4h, timeout numeric drifting 170→178)
+        # is immune to result-text mitigation. The watchdog tracks a
+        # rolling signature (tool name + args with volatile numerics like
+        # timeout/wait dropped) at the tool-executor seam; at max_streak
+        # it fires a bounded synthetic nudge ordering a strategy change,
+        # and after max_nudges nudges (spaced nudge_grace calls apart) it
+        # force-ends the turn so the worker surfaces. Any different call
+        # resets the streak, so paging reads, poll/log alternation, and
+        # arg-changing retries never trigger it.
+        "repetition_watchdog": {
+            "enabled": True,
+            "max_streak": 5,
+            "max_nudges": 2,
+            "nudge_grace": 3,
+        },
         "service_tier": "",
         "fast_auto_seconds": 60,
         # Tool-use enforcement: injects system prompt guidance that tells the
@@ -2965,6 +2982,18 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Progress watchdog (run-244 wedge class, t_3df0dd33): reclaims a
+        # running task whose heartbeat cadence is ALIVE but whose real
+        # progress (progress-flagged heartbeats — new tool name/args,
+        # non-empty assistant text, explicit kanban_heartbeat) has been
+        # stale for ``progress_stale_seconds``. Default OFF; enable on
+        # fleets that saw the verbatim-retry wedge. ``min_runtime_seconds``
+        # protects young tasks from a slow first LLM call being flagged.
+        "progress_watchdog": {
+            "enabled": False,
+            "progress_stale_seconds": 1800,
+            "min_runtime_seconds": 600,
+        },
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible

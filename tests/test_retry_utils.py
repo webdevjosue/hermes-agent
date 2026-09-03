@@ -169,6 +169,187 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def _zai_rate_limit_error():
+    """The other transient Z.AI Coding Plan 429: code 1302 'Rate limit reached
+    for requests'. Observed in production 2026-08-31 (~22:57-22:59) killing
+    kanban workers on glm-5.3-flash that exhausted the old 3-attempt budget in
+    ~10s while the limit window lasted ~2 minutes (see crashed sessions
+    20260831_225716_bfbdb9 / 20260831_225816_374804)."""
+    return SimpleNamespace(
+        status_code=429,
+        message="Error code: 429 - {'error': {'code': '1302', 'message': 'Rate limit reached for requests'}}",
+        body={
+            "error": {
+                "code": "1302",
+                "message": "Rate limit reached for requests",
+            }
+        },
+    )
+
+
+def test_zai_coding_rate_limit_1302_gets_adaptive_backoff():
+    """Regression (2026-08-31 worker crashes): code-1302 429s on glm-5.3-flash
+    must match the Z.AI Coding adaptive policy so the retry loop extends its
+    ceiling and survives the ~2min account-wide limit window instead of exiting
+    at ~10s. Previously only glm-5.2 + code 1305 matched."""
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model="glm-5.3-flash",
+        error=_zai_rate_limit_error(),
+    ) is True
+
+
+def test_zai_coding_rate_limit_1302_long_tier_reachable(monkeypatch):
+    """With the widened matcher, the 1302 error walks the same extended ceiling
+    and reaches the long-backoff tier within it."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+    err = _zai_rate_limit_error()
+    ceiling = zai_coding_overload_retry_ceiling()
+
+    long_waits = []
+    for attempt in range(1, ceiling):
+        _wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            model="glm-5.3-flash",
+            error=err,
+            default_wait=1.0,
+        )
+        if policy == "zai_coding_overload_long":
+            long_waits.append(_wait)
+
+    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
+def test_zai_coding_matcher_still_scoped_to_coding_endpoint_and_429():
+    """Widening must not leak: non-coding z.ai endpoints, non-429 errors, and
+    non-GLM-5 models stay outside the adaptive policy (they keep the ordinary
+    short retry path)."""
+    err = _zai_rate_limit_error()
+    # Wrong endpoint (public PAAS API, not the Coding Plan).
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/paas/v4", model="glm-5.3-flash", error=err
+    ) is False
+    # Not a 429.
+    err_500 = SimpleNamespace(status_code=500, body=err.body)
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3-flash", error=err_500
+    ) is False
+    # Older GLM-4 family stays on the ordinary path.
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-4.5-flash", error=err
+    ) is False
+
+
+# ---------------------------------------------------------------------------
+# Z.AI Coding transient 401/1000 — bounded same-provider retry (2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+def _zai_transient_auth_error():
+    """The 2026-08-31 peak (~23:00-03:00 PDT) crash shape: HTTP 401 with body
+    code 1000 'Authentication Failed' from the Coding Plan endpoint on
+    glm-5.3 / glm-5.3-flash while sibling workers on the SAME account
+    succeeded in the same window — intermittent auth flakiness under load,
+    not a dead key. Killed seo sessions 20260831_233032_3ec490 /
+    20260831_234540_e17d07 and designer session 20260831_232933_b33e0a as
+    non_retryable_client_error on their first hit."""
+    return SimpleNamespace(
+        status_code=401,
+        message="Error code: 401 - {'error': {'code': '1000', 'message': 'Authentication Failed'}}",
+        body={
+            "error": {
+                "code": "1000",
+                "message": "Authentication Failed",
+            }
+        },
+    )
+
+
+def test_zai_coding_transient_auth_1000_matches():
+    """Both observed model spellings (glm-5.3 from the seo dumps,
+    glm-5.3-flash from the designer dump) must match the transient-auth
+    matcher so the loop retries the same provider before any failover."""
+    from agent.retry_utils import is_zai_coding_transient_auth_error
+
+    for model in ("glm-5.3", "glm-5.3-flash"):
+        assert is_zai_coding_transient_auth_error(
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            model=model,
+            error=_zai_transient_auth_error(),
+        ) is True
+
+
+def test_zai_coding_transient_auth_backoff_is_30_then_60(monkeypatch):
+    """The bounded same-provider retry waits ~30s then ~60s (adaptive-wait
+    style: table base + light jitter), and the budget matches the table.
+
+    The module is resolved *inside* the test so the monkeypatch and the
+    imported helper share one module object even when earlier suite tests
+    evicted/re-imported ``agent.retry_utils`` in ``sys.modules`` (a stale
+    top-level binding would patch a dead copy and the real jitter would
+    leak into the assertion)."""
+    import agent.retry_utils as live_retry_utils
+
+    monkeypatch.setattr(
+        live_retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"]
+    )
+    ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET = live_retry_utils.ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET
+    zai_coding_transient_auth_backoff = live_retry_utils.zai_coding_transient_auth_backoff
+
+    waits = [
+        zai_coding_transient_auth_backoff(n)
+        for n in range(1, ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET + 1)
+    ]
+    assert waits == [30.0, 60.0]
+    assert ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET == 2
+    # Clamped beyond the table so an over-budget caller can't IndexError.
+    assert zai_coding_transient_auth_backoff(99) == 60.0
+
+
+def test_zai_coding_transient_auth_matcher_negatives():
+    """The matcher must stay scoped: a plain OpenAI-style 401, a non-coding
+    z.ai base_url, a non-GLM-5 model, and a 401 whose body code is not 1000
+    all stay OUTSIDE the bounded retry (they keep the generic fail-fast +
+    fallback 401 classification)."""
+    from agent.retry_utils import is_zai_coding_transient_auth_error
+
+    err = _zai_transient_auth_error()
+    # Plain OpenAI-style 401 (different provider/endpoint entirely).
+    openai_err = SimpleNamespace(
+        status_code=401,
+        message="Error code: 401 - Incorrect API key provided",
+        body={"error": {"message": "Incorrect API key provided"}},
+    )
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.openai.com/v1", model="gpt-5.1", error=openai_err
+    ) is False
+    # Right error shape, wrong endpoint (public PAAS API, not Coding Plan).
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.z.ai/api/paas/v4", model="glm-5.3", error=err
+    ) is False
+    # Right error shape, non-GLM-5 model.
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-4.5-flash", error=err
+    ) is False
+    # Right endpoint/model but a 401 with a different body code — that is a
+    # real credential problem, not the transient blip.
+    other_code = SimpleNamespace(
+        status_code=401,
+        message="Error code: 401 - {'error': {'code': '401', 'message': 'Invalid key'}}",
+        body={"error": {"code": "401", "message": "Invalid key"}},
+    )
+    assert is_zai_coding_transient_auth_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3", error=other_code
+    ) is False
+    # And the overload matcher must NOT swallow the auth shape (401 ≠ 429).
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3", error=err
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------

@@ -18,12 +18,13 @@ from typing import Any, Optional
 _jitter_counter = 0
 _jitter_lock = threading.Lock()
 
-# Z.AI Coding Plan's GLM-5.2 endpoint often returns HTTP 429 code 1305
-# ("The service may be temporarily overloaded...") for otherwise valid
-# Hermes requests. Short retries tend to hammer the same overloaded window;
-# after a few normal retries, progressively widen the wait window. Keep the
-# cap interactive-friendly: a simple TUI message should fail visibly in minutes,
-# not sit silent for 20+ minutes.
+# Z.AI Coding Plan's GLM-5 endpoints return transient HTTP 429s in two shapes:
+# code 1305 ("The service may be temporarily overloaded...") and code 1302
+# ("Rate limit reached for requests" — account/request-rate window, observed
+# 2026-08-31 sustaining ~2 minutes). Short retries tend to hammer the same
+# window; after a few normal retries, progressively widen the wait window.
+# Keep the cap interactive-friendly: a simple TUI message should fail visibly
+# in minutes, not sit silent for 20+ minutes.
 _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 
 # Number of initial short retries before the adaptive long-backoff tier kicks
@@ -140,23 +141,79 @@ def _error_text(error: Any) -> str:
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
-    """Return True for Z.AI Coding Plan transient overload 429s.
+    """Return True for transient Z.AI Coding Plan 429s worth of adaptive backoff.
 
-    The coding-plan endpoint reports overload as HTTP 429 with body code 1305
-    and message "The service may be temporarily overloaded...". Treat only
-    that narrow shape specially so ordinary quota/billing 429s still fail fast
-    through the existing classifier.
+    Two production shapes qualify (both on the Coding Plan endpoint, GLM-5
+    family models, HTTP 429):
+    - code 1305 "The service may be temporarily overloaded..." (capacity), and
+    - code 1302 "Rate limit reached for requests" (account/request-rate limit).
+
+    The 1302 shape observed 2026-08-31 (~22:57) exhausted the default 3-attempt
+    budget in ~10s while the limit window lasted ~2 minutes, killing kanban
+    workers on their first LLM call (glm-5.3-flash). Ordinary quota/billing
+    429s on other providers/models still fail fast through the classifier.
     """
     base = (base_url or "").lower()
     model_name = (model or "").lower()
     status = getattr(error, "status_code", None)
     text = _error_text(error)
-    return (
-        status == 429
-        and "api.z.ai/api/coding/paas/v4" in base
-        and "glm-5.2" in model_name
-        and ("1305" in text or "temporarily overloaded" in text)
-    )
+    if status != 429:
+        return False
+    if "api.z.ai/api/coding/paas/v4" not in base:
+        return False
+    if "glm-5" not in model_name:
+        return False
+    if "1305" in text or "temporarily overloaded" in text:
+        return True
+    return "1302" in text or "rate limit reached" in text
+
+
+def is_zai_coding_transient_auth_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
+    """Return True for the transient Z.AI Coding Plan 401/1000 worth of a
+    bounded same-provider retry.
+
+    Production shape (2026-08-31 peak, ~23:00-03:00 PDT): HTTP 401 with body
+    code 1000 "Authentication Failed" from the Coding Plan endpoint on
+    glm-5.3 / glm-5.3-flash under concurrent load, while sibling workers on
+    the SAME account succeeded in the same window — intermittent auth
+    flakiness under load, not a dead key. The generic 401 classification
+    (auth, retryable=False) sent those sessions straight to the terminal
+    client-error exit, killing kanban workers before fallback_providers
+    existed. Scoped as narrowly as ``is_zai_coding_overload_error`` so
+    ordinary 401s on every other provider/model keep failing fast.
+    """
+    base = (base_url or "").lower()
+    model_name = (model or "").lower()
+    status = getattr(error, "status_code", None)
+    text = _error_text(error)
+    if status != 401:
+        return False
+    if "api.z.ai/api/coding/paas/v4" not in base:
+        return False
+    if "glm-5" not in model_name:
+        return False
+    return "1000" in text or "authentication failed" in text
+
+
+_ZAI_CODING_TRANSIENT_AUTH_BACKOFF = (30.0, 60.0)
+
+# Per-run budget of same-provider retries for the transient 401/1000 above:
+# enough to ride out the observed blip windows, small enough that a
+# genuinely dead key still reaches fallback/terminal quickly (~90s worst
+# case). Counted on TurnRetryState so it resets per API-call block.
+ZAI_CODING_TRANSIENT_AUTH_RETRY_BUDGET = len(_ZAI_CODING_TRANSIENT_AUTH_BACKOFF)
+
+
+def zai_coding_transient_auth_backoff(retry_number: int) -> float:
+    """Adaptive-style wait for the n-th transient-auth retry (1-based).
+
+    30s then 60s (plus light jitter), clamped past the table so an
+    over-budget caller can't IndexError. Mirrors the wait style of
+    ``adaptive_rate_limit_backoff``'s long tier.
+    """
+    idx = min(max(retry_number, 1) - 1, len(_ZAI_CODING_TRANSIENT_AUTH_BACKOFF) - 1)
+    base_delay = _ZAI_CODING_TRANSIENT_AUTH_BACKOFF[idx]
+    return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2)
 
 
 def adaptive_rate_limit_backoff(

@@ -1430,6 +1430,53 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # Progress watchdog (run-244 wedge class): kanban.progress_watchdog.*
+        # — reclaim running tasks whose heartbeat is alive but whose real
+        # progress (progress-flagged heartbeats) went stale. Default OFF.
+        pw_cfg = kanban_cfg.get("progress_watchdog") or {}
+        if not isinstance(pw_cfg, dict):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.progress_watchdog=%r; ignoring",
+                pw_cfg,
+            )
+            pw_cfg = {}
+        pw_enabled = bool(pw_cfg.get("enabled", False))
+        progress_stale_seconds = 0
+        progress_min_runtime_seconds = _kb.DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS
+        if pw_enabled:
+            try:
+                progress_stale_seconds = int(
+                    pw_cfg.get(
+                        "progress_stale_seconds",
+                        _kb.DEFAULT_PROGRESS_STALE_SECONDS,
+                    )
+                )
+            except (TypeError, ValueError):
+                progress_stale_seconds = _kb.DEFAULT_PROGRESS_STALE_SECONDS
+            if progress_stale_seconds < 1:
+                progress_stale_seconds = _kb.DEFAULT_PROGRESS_STALE_SECONDS
+            try:
+                progress_min_runtime_seconds = int(
+                    pw_cfg.get(
+                        "min_runtime_seconds",
+                        _kb.DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS,
+                    )
+                )
+            except (TypeError, ValueError):
+                progress_min_runtime_seconds = (
+                    _kb.DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS
+                )
+            if progress_min_runtime_seconds < 1:
+                progress_min_runtime_seconds = (
+                    _kb.DEFAULT_PROGRESS_MIN_RUNTIME_SECONDS
+                )
+            logger.info(
+                "kanban dispatcher: progress watchdog enabled "
+                "(stale=%ss, min_runtime=%ss)",
+                progress_stale_seconds,
+                progress_min_runtime_seconds,
+            )
+
         # kanban.reconcile_orphans (config.yaml, default true): each tick,
         # requeue 'running' cards whose claim bookkeeping is broken (no
         # valid claim, dead/gone worker) — the zombie-card reconciliation
@@ -1573,6 +1620,8 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    progress_stale_seconds=progress_stale_seconds,
+                    progress_min_runtime_seconds=progress_min_runtime_seconds,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

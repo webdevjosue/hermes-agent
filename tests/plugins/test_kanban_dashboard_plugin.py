@@ -981,7 +981,8 @@ def test_event_dict_includes_run_id(client):
     try:
         kb.claim_task(conn, tid)
         run_id = kb.latest_run(conn, tid).id
-        kb.complete_task(conn, tid, summary="wss")
+        # run-263 guard: pass ownership like a real worker.
+        kb.complete_task(conn, tid, summary="wss", expected_run_id=run_id)
     finally:
         conn.close()
 

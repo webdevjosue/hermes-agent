@@ -82,7 +82,12 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
             tid = kb.create_task(conn, title="t", assignee="worker")
             kb.claim_task(conn, tid)
             # Despite the raising hook, completion succeeds and persists.
-            assert kb.complete_task(conn, tid, summary="ok") is True
+            # run-263 guard: pass ownership (claimed → running under a
+            # live claim) like a real dispatcher worker would.
+            assert kb.complete_task(
+                conn, tid, summary="ok",
+                expected_run_id=kb.get_task(conn, tid).current_run_id,
+            ) is True
             assert kb.get_task(conn, tid).status == "done"
         finally:
             conn.close()

@@ -579,6 +579,45 @@ def _run_tool_activity_heartbeat(
         pass
 
 
+def _observe_repetition_watchdog(agent, function_name: str, function_args: dict) -> None:
+    """Feed one about-to-dispatch call into the near-identical-call watchdog.
+
+    Both executor paths funnel through
+    ``_run_agent_tool_execution_middleware`` → ``_authorized_dispatch``, so
+    this single observation seam covers every runtime tool call (sequential,
+    concurrent, and segmented — the segmented dispatcher delegates to the
+    other two). Best-effort: watchdog bookkeeping must never break dispatch.
+
+    The decision is stashed on the agent (``_repetition_watchdog_pending_nudge``
+    / ``_repetition_watchdog_force_end``) for the executor/loop to consume
+    AFTER the batch completes — nudging mid-batch would interleave a user
+    message between tool calls and the tool results, breaking role
+    alternation for the provider request.
+    """
+    watchdog = getattr(agent, "_repetition_watchdog", None)
+    if watchdog is None:
+        return
+    try:
+        decision = watchdog.observe(function_name, function_args)
+        if decision.action == "nudge" and decision.nudge_text:
+            agent._repetition_watchdog_pending_nudge = decision.nudge_text
+            logger.info(
+                "repetition watchdog nudge: %s streak=%d",
+                function_name,
+                decision.streak,
+            )
+        elif decision.action == "force_end":
+            agent._repetition_watchdog_force_end = True
+            logger.warning(
+                "repetition watchdog FORCE-END: %s streak=%d — turn will be "
+                "ended (near-identical call loop persisted past nudge budget)",
+                function_name,
+                decision.streak,
+            )
+    except Exception as exc:
+        logger.debug("repetition watchdog observation failed: %s", exc)
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -618,6 +657,8 @@ def _run_agent_tool_execution_middleware(
             state["dispatched"] = True
             state["blocked"] = False
             state["args"] = final_args
+
+        _observe_repetition_watchdog(agent, function_name, final_args)
 
         def _begin() -> None:
             _begin_tool_execution(
@@ -1916,9 +1957,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug("Tool output risk callback error: %s", cb_err)
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
-    # Keep /steer pending until the final post-budget drain below.  The model
-    # cannot observe a partial batch, while an early drain can be discarded
-    # when aggregate budget enforcement replaces that tool result.
+    # Keep /steer pending until the final post-budget drain below.  The
+    # model cannot observe a partial batch, while an early drain can be
+    # discarded when aggregate budget enforcement replaces that tool result.
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
@@ -1930,6 +1971,36 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # so the steer marker is never truncated. See steer() for details.
     if finalize and num_tools > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
+
+    # ── Repetition-watchdog nudge delivery ────────────────────────────
+    if finalize:
+        _deliver_repetition_watchdog_nudge(agent, messages)
+
+
+def _deliver_repetition_watchdog_nudge(agent, messages: list) -> None:
+    """Append a pending repetition-watchdog nudge as a synthetic user message.
+
+    Called at end-of-batch by both executor paths (and the segmented
+    dispatcher's whole-turn finalize). The nudge text was stashed by
+    ``_observe_repetition_watchdog`` when the streak threshold fired; it is
+    delivered exactly once and flagged ``_repetition_watchdog_synthetic`` so
+    persistence strips it like the other bounded nudges (kanban_stop class).
+    """
+    nudge = getattr(agent, "_repetition_watchdog_pending_nudge", None)
+    if not nudge:
+        return
+    agent._repetition_watchdog_pending_nudge = None
+    try:
+        messages.append(
+            {
+                "role": "user",
+                "content": nudge,
+                "_repetition_watchdog_synthetic": True,
+            }
+        )
+        logger.info("repetition watchdog nudge delivered to conversation")
+    except Exception as exc:
+        logger.debug("repetition watchdog nudge delivery failed: %s", exc)
 
 
 
@@ -2869,6 +2940,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
+    # ── Repetition-watchdog nudge delivery ────────────────────────────
+    # Appended AFTER all tool results so the synthetic user message never
+    # interleaves with the assistant tool-call block (role alternation).
+    if finalize:
+        _deliver_repetition_watchdog_nudge(agent, messages)
+
 
 
 
@@ -2930,6 +3007,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             config=_tool_budget,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
+        _deliver_repetition_watchdog_nudge(agent, messages)
 
 
 __all__ = [

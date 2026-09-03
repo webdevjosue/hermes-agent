@@ -38,6 +38,13 @@ class ActivityProvenance(str, Enum):
     AGENT_COMPRESSION_TIMEOUT = "agent.compression_timeout"
     AGENT_COMPRESSION_COOLDOWN = "agent.compression_cooldown"
     AGENT_COMPRESSION_TURNHOLD = "agent.compression_turnhold"
+    # Real forward progress (new tool call, new args, non-empty assistant
+    # text, explicit kanban_heartbeat). The runtime-activity ->
+    # board-heartbeat bridge (tools/kanban_tools.py) bumps the board
+    # heartbeat ONLY for these, never for passive stream/wait ticks — the
+    # run-244 wedge (t_3df0dd33) showed passive ticks acting as
+    # self-sustaining liveness cover for a stalled worker.
+    AGENT_PROGRESS = "agent.progress"
 
 
 def bound_activity_description(description: Optional[str]) -> str:

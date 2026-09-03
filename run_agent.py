@@ -291,6 +291,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # repetition-watchdog nudge (run-244 wedge class): bounded synthetic
+    # user nudge appended after a near-identical tool-call streak; exists
+    # only to steer the live turn, must not replay on resume.
+    "_repetition_watchdog_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
     # and the "issue the actual tool call now" user nudge exist only to
@@ -4542,7 +4546,9 @@ class AIAgent:
                     heartbeat_current_worker_from_env,
                     inject_new_comments_from_env,
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(
+                    desc=desc, provenance=provenance
+                )
                 # Fold any new operator notes into the running turn (OUT-OF-BAND
                 # steer) so the user can talk to a live task without a restart.
                 inject_new_comments_from_env(self)
@@ -9050,6 +9056,38 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+
+        # Progress signal for the kanban board heartbeat bridge (run-244
+        # wedge, t_3df0dd33): non-empty assistant text and each dispatched
+        # tool call are REAL progress. Best-effort; never blocks dispatch.
+        try:
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                from tools.kanban_tools import mark_board_progress
+
+                _content = getattr(assistant_message, "content", None)
+                if _content and str(_content).strip():
+                    mark_board_progress(kind="text", desc=str(_content))
+                for _tc in tool_calls or []:
+                    _fname = getattr(getattr(_tc, "function", None), "name", None)
+                    if not _fname:
+                        continue
+                    _fargs_raw = getattr(
+                        getattr(_tc, "function", None), "arguments", None
+                    )
+                    _fargs = None
+                    if isinstance(_fargs_raw, dict):
+                        _fargs = _fargs_raw
+                    elif isinstance(_fargs_raw, str):
+                        try:
+                            _parsed = json.loads(_fargs_raw)
+                            _fargs = _parsed if isinstance(_parsed, dict) else None
+                        except Exception:
+                            _fargs = None
+                    mark_board_progress(
+                        kind="tool", tool_name=_fname, args=_fargs
+                    )
+        except Exception:
+            pass
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True

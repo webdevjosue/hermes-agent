@@ -212,6 +212,69 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+# Profiles whose kanban_complete summaries MUST carry an explicit
+# loop-closure trace.  Fleet Loop Digest 2026-08-31 Week 1 found 0/15
+# audited done cards with the trace despite the LOOP-CLOSURE LAW text
+# shipping in every SOUL.md / system prompt — awareness alone does not
+# enforce behaviour, so the completion path hard-gates it.  Card
+# t_31b252aa scoped this to the orchestrator; card t_a617051b adds
+# 'frontend' as pilot #2 after the 2026-09-01 Daily digest showed the
+# prompt-only profile at 2/7 trace compliance vs 3/3 for the gated
+# orchestrator.  Extend this set further only after each pilot shows
+# the same clean adoption (weekly Fleet Loop Optimizer audit,
+# Mon 09:00).
+_LOOP_TRACE_REQUIRED_PROFILES = frozenset({"default", "frontend"})
+
+# A summary passes when it contains the explicit nothing-new escape
+# hatch or all four trace verbs (the audit regex the weekly optimizer
+# runs is kept intentionally looser — this gate enforces the strict
+# form at write time so audits stay clean).
+_LOOP_TRACE_NOTHING_NEW = "loop-closure: nothing new"
+_LOOP_TRACE_VERBS = ("attempted", "failed", "verified", "do-differently")
+
+
+def _active_profile() -> str:
+    """Best-effort acting-profile name (env first, config fallback)."""
+    name = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if name:
+        return name
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _missing_loop_trace(summary: Optional[str]) -> Optional[str]:
+    """Return a rejection message when a required trace is absent.
+
+    Applies only to profiles listed in ``_LOOP_TRACE_REQUIRED_PROFILES``
+    (the orchestrator + frontend pilot).  The check is purely textual on the summary +
+    legacy result field, runs BEFORE any DB mutation, and returns a
+    retryable tool_error — the task stays in-flight so the worker can
+    simply re-call kanban_complete with the trace appended.
+    """
+    if _active_profile() not in _LOOP_TRACE_REQUIRED_PROFILES:
+        return None
+    text = str(summary or "")
+    if _LOOP_TRACE_NOTHING_NEW in text.lower():
+        return None
+    lowered = text.lower()
+    missing = [v for v in _LOOP_TRACE_VERBS if v not in lowered]
+    if missing:
+        return (
+            "kanban_complete blocked by LOOP-CLOSURE LAW gate: summary "
+            f"lacks the execution trace (missing: {', '.join(missing)}). "
+            "Append 2-3 lines to the summary in the form "
+            "'attempted: ... / failed: ... / verified: ... / "
+            "do-differently: ...', or state 'loop-closure: nothing new' "
+            "if the run genuinely produced no lesson. Task is still "
+            "in-flight — retry kanban_complete with the same handoff "
+            "plus the trace."
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -304,33 +367,160 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
-def heartbeat_current_worker_from_env() -> bool:
-    """Best-effort: extend the kanban claim + bump board heartbeat for the
-    current dispatcher-spawned worker, using identity from env vars.
+def _now_monotonic() -> float:
+    """Indirection for tests (monkeypatch ``tools.kanban_tools._now_monotonic``)."""
+    import time as _time
 
-    Returns True if a write was attempted (whether or not it succeeded);
-    False if the call was skipped (not a kanban worker, rate-limited, or
-    swallowed exception). The boolean is informational — callers should
-    not branch on it.
+    return _time.monotonic()
 
-    Identity comes from:
-      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
-      * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
-        a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
 
-    Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
-    timestamp (monotonic clock); not thread-safe in the strict sense, but
-    the worst case is one extra DB write per race, which is harmless.
+# Progress-gating state (run-244 wedge, t_3df0dd33): the bridge used to bump
+# the board heartbeat on EVERY activity tick, so 217 passive stream/wait
+# heartbeats masked a 4-hour stall from ``detect_stale_running``. The board
+# heartbeat write now fires only on PROGRESS: a new tool name, a new
+# normalized-args signature (volatile wait-shaping numerics like ``timeout``
+# dropped, reusing ``RepetitionWatchdogState.signature`` — its static
+# normalizer only, never the shared unguarded streak state per the
+# t_5b9c8c40 review caveat), changed non-empty assistant text, the explicit
+# ``kanban_heartbeat`` tool, or an activity stamp carrying the
+# ``AGENT_PROGRESS`` provenance. The claim-TTL half (``heartbeat_claim``)
+# stays progress-UNgated: a healthy worker inside one long tool call must
+# keep its claim alive (the #23025 trap the bridge originally fixed).
+_progress_last_tool_sig: Optional[str] = None
+_progress_last_text_hash: Optional[str] = None
+
+
+def _reset_progress_gate_state() -> None:
+    """Test hook: clear the module-level progress-signature trackers."""
+    global _progress_last_tool_sig, _progress_last_text_hash
+    _progress_last_tool_sig = None
+    _progress_last_text_hash = None
+
+
+def _tool_call_signature(tool_name: str, args: Optional[dict]) -> Optional[str]:
+    """Normalized signature of a tool call for progress comparison.
+
+    Reuses the repetition watchdog's static normalizer (volatile arg keys
+    dropped) so the exact run-244 drift (timeout 170->175->178 across 76
+    identical polls) is NOT progress while a genuinely different call is.
+    Static + lock-free; the watchdog's shared streak state is not touched.
     """
-    global _auto_heartbeat_last_attempt
+    try:
+        from agent.tool_call_repetition_watchdog import RepetitionWatchdogState
+
+        return RepetitionWatchdogState.signature(tool_name, args)
+    except Exception:
+        return None
+
+
+def _text_signature(desc: Optional[str]) -> Optional[str]:
+    """Hash of a non-empty assistant text for change detection."""
+    import hashlib as _hashlib
+
+    text = (desc or "").strip()
+    if not text:
+        return None
+    return _hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def mark_board_progress(
+    *,
+    kind: str,
+    desc: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    args: Optional[dict] = None,
+    provenance=None,
+) -> bool:
+    """Gated runtime-activity -> board-heartbeat bridge entry point.
+
+    Classifies a progress report and, when it represents REAL progress (or
+    when enough passive time has accumulated to keep the claim TTL alive),
+    performs the same best-effort board writes the old bridge did:
+
+    - ``heartbeat_claim`` — ALWAYS attempted on every eligible tick
+      (rate-limited 60s) regardless of progress, so a live worker inside
+      one long tool call is never reclaimed by ``release_stale_claims``.
+    - ``heartbeat_worker(progress=...)`` — attempted ONLY on progress
+      signals. ``progress=True`` writes also stamp the board's durable
+      ``last_progress_at`` so the dispatcher's progress watchdog
+      (``detect_progress_stalled``) can see the difference between
+      "heartbeat alive" and "actually making progress".
+
+    Kinds:
+
+    - ``"tool"``: a dispatched tool call (name + normalized args). Progress
+      when the signature differs from the last observed one.
+    - ``"text"``: assistant text; progress when non-empty and changed.
+    - ``"explicit"``: the explicit ``kanban_heartbeat`` tool — always
+      progress (model intent).
+    - ``"activity"``: a passive activity stamp; progress ONLY when it
+      carries ``provenance=ActivityProvenance.AGENT_PROGRESS``.
+
+    Returns True when a progress write was attempted; False when the gate
+    suppressed it. Never raises (fail-open, same contract as the bridge).
+    """
+    global _auto_heartbeat_last_attempt, _progress_last_tool_sig, _progress_last_text_hash
+
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
-    import time as _time
-    now = _time.monotonic()
+
+    is_progress = False
+    if kind == "explicit":
+        is_progress = True
+    elif kind == "tool":
+        sig = _tool_call_signature(tool_name or "", args)
+        if sig is not None:
+            if sig != _progress_last_tool_sig:
+                is_progress = True
+            # Advance the tracker even when the write is rate-limited so a
+            # later identical re-issue after the window is still recognized
+            # as not-progress (run-244 poll-loop shape).
+            _progress_last_tool_sig = sig
+        else:
+            # Normalizer unavailable (import failure): fail-open as progress.
+            is_progress = True
+    elif kind == "text":
+        text_hash = _text_signature(desc)
+        if text_hash is not None and text_hash != _progress_last_text_hash:
+            is_progress = True
+            _progress_last_text_hash = text_hash
+    elif kind == "activity":
+        try:
+            from agent.session_activity import ActivityProvenance
+
+            if provenance is ActivityProvenance.AGENT_PROGRESS:
+                is_progress = True
+        except Exception:
+            pass
+
+    if not is_progress:
+        # Not progress, but time may still have elapsed past the rate window:
+        # refresh the claim TTL only (the #23025 protection), never the board
+        # heartbeat.
+        now = _now_monotonic()
+        if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return False
+        _auto_heartbeat_last_attempt = now
+        try:
+            kb, conn = _connect()
+            try:
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                try:
+                    kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+                except Exception:
+                    logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        return False
+
+    # Progress: rate-limited combined write (claim + board heartbeat).
+    now = _now_monotonic()
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
     _auto_heartbeat_last_attempt = now
@@ -349,7 +539,9 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id, progress=True
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -361,6 +553,56 @@ def heartbeat_current_worker_from_env() -> bool:
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
         return False
+
+
+def heartbeat_current_worker_from_env(
+    *,
+    provenance=None,
+    tool_name: Optional[str] = None,
+    args: Optional[dict] = None,
+    desc: Optional[str] = None,
+    explicit: bool = False,
+) -> bool:
+    """Best-effort: extend the kanban claim + bump board heartbeat for the
+    current dispatcher-spawned worker, using identity from env vars.
+
+    PROGRESS-GATED (run-244 wedge, t_3df0dd33): the board heartbeat half
+    only fires on real progress (see ``mark_board_progress``); passive
+    stream/wait activity ticks refresh the claim TTL only, so a wedged
+    worker emitting bare identical tool calls every ~3min no longer looks
+    alive to ``detect_stale_running`` / ``detect_progress_stalled``.
+
+    Returns True if a progress write was attempted (whether or not it
+    succeeded); False if the call was skipped (not a kanban worker,
+    rate-limited, gate-suppressed, or swallowed exception). The boolean is
+    informational — callers should not branch on it.
+
+    Identity comes from:
+      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
+      * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
+        a stale run that may have already been reclaimed
+      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
+        falls back to the default ``_claimer_id()`` for locally-driven
+        workers that never went through the dispatcher path
+
+    Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
+    timestamp (monotonic clock); not thread-safe in the strict sense, but
+    the worst case is one extra DB write per race, which is harmless.
+    """
+    if explicit:
+        return mark_board_progress(kind="explicit")
+    if tool_name is not None:
+        return mark_board_progress(kind="tool", tool_name=tool_name, args=args)
+    if desc is not None:
+        # Wait notices / stream ticks arrive as bare descriptions; only
+        # texts explicitly marked as assistant output count as progress
+        # via the provenance gate below. Treat desc-only calls as passive
+        # activity unless the caller passed AGENT_PROGRESS.
+        from agent.session_activity import normalize_activity_provenance
+
+        prov = normalize_activity_provenance(provenance)
+        return mark_board_progress(kind="activity", desc=desc, provenance=prov)
+    return mark_board_progress(kind="activity", provenance=provenance)
 
 
 # Live operator-note injection: poll the worker's task for new comments and
@@ -743,6 +985,12 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             "provide at least one of: summary (preferred), result"
         )
+    # LOOP-CLOSURE LAW gate (cards t_31b252aa + t_a617051b): scoped to
+    # the orchestrator + frontend pilot — reject trace-less completion
+    # summaries BEFORE any DB mutation so the worker can retry cheaply.
+    loop_trace_err = _missing_loop_trace(summary or result)
+    if loop_trace_err:
+        return tool_error(loop_trace_err)
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
@@ -792,6 +1040,23 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{artifact_err}. Your task is still in-flight and its "
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
+                )
+            except kb.ClaimOwnershipError as own_err:
+                # Structured rejection (run-263 incident, t_7f85aa6f): a
+                # non-owner (no HERMES_KANBAN_RUN_ID match) tried to
+                # complete a task running under someone else's live
+                # claim. Nothing was mutated — audit event already
+                # landed. Tell the caller how to proceed instead of
+                # crashing the run.
+                return tool_error(
+                    f"kanban_complete refused: {own_err}. Your task was "
+                    f"NOT completed and was NOT mutated — it is still "
+                    f"running under the owning worker's claim. Either: "
+                    f"(1) you are the spawned worker on another card — "
+                    f"do not complete cards you were not dispatched to; "
+                    f"(2) an operator wants to force-close it — use "
+                    f"`hermes kanban complete <task_id> --force` or the "
+                    f"dashboard 'done' action (explicit human override)."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -1080,6 +1345,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                progress=True,
             )
             if not ok:
                 return tool_error(
@@ -1247,6 +1513,7 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                 continue
             resp.raise_for_status()
             content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
+            content_length_hdr = resp.headers.get("content-length")
             for chunk in resp.iter_bytes(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
@@ -1254,7 +1521,24 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                         f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
                     )
                 chunks.append(chunk)
-        return b"".join(chunks), content_type
+        data = b"".join(chunks)
+        # Evidence-integrity cross-check (card t_a4c2395b): a server (or a
+        # proxy) that truncates the body while declaring a larger
+        # Content-Length yields a silently corrupt attachment. Mismatch →
+        # loud failure; the caller can retry.
+        declared: Optional[int] = None
+        if content_length_hdr:
+            try:
+                declared = int(content_length_hdr.strip())
+            except ValueError:
+                declared = None
+        if declared is not None and declared != len(data):
+            raise ValueError(
+                f"Content-Length mismatch fetching {url}: header declared "
+                f"{declared} bytes but {len(data)} bytes were received — the "
+                f"transfer was truncated; refusing to store a partial file."
+            )
+        return data, content_type
     raise ValueError(f"too many redirects fetching {url}")
 
 
@@ -1798,7 +2082,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. "
+        "LOOP-CLOSURE LAW: the summary MUST end with a 2-3 line "
+        "execution trace — 'attempted: ... / failed: ... / verified: "
+        "... / do-differently: ...' — or the explicit line "
+        "'loop-closure: nothing new' when the run genuinely taught "
+        "nothing. Trace-less completions are rejected (enforced for "
+        "the orchestrator + frontend profiles)."
     ),
     "parameters": {
         "type": "object",
@@ -2061,7 +2351,12 @@ KANBAN_ATTACH_SCHEMA = {
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "kanban_attach_url when you only have a URL. IMPORTANT: the "
+        "payload's magic bytes are verified against the filename "
+        "extension and against what lands on disk — a base64 blob you "
+        "composed from memory (a truncated or fabricated file header) "
+        "will be REJECTED. Read the real file and base64-encode its "
+        "actual bytes, or use kanban_attach_url."
     ),
     "parameters": {
         "type": "object",

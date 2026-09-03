@@ -710,6 +710,16 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    # Near-identical tool-call watchdog (run-244 wedge class): per-turn reset
+    # so one turn's streak cannot poison the next. The pending nudge and
+    # force-end flag are consumed by the loop before the next turn starts.
+    try:
+        agent._repetition_watchdog.reset_for_turn()
+        agent._repetition_watchdog_pending_nudge = None
+        agent._repetition_watchdog_force_end = False
+    except AttributeError:
+        # Agent doubles built before the watchdog attribute existed.
+        pass
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
