@@ -54,7 +54,16 @@ _SCHTASKS_TIMEOUT_S = 15
 _SCHTASKS_NO_OUTPUT_TIMEOUT_S = 30
 # Patterns in schtasks stderr that mean "fall back to the Startup folder".
 _FALLBACK_PATTERNS = re.compile(
-    r"(access is denied|acceso denegado|přístup byl odepřen|schtasks timed out|schtasks produced no output)",
+    r"(access is denied|acceso denegado|přístup byl odepřen|schtasks timed out|schtasks produced no output"
+    # Scheduler-level failures: the Task Scheduler service is down/unreachable
+    # (RPC endpoint dead) or its store is broken. Observed on Windows when the
+    # service dies at boot: EVERY schtasks verb returns this same error. The
+    # Startup folder is an independent autostart mechanism that still works,
+    # so fall back instead of raising.
+    r"|network address is invalid"
+    r"|the service cannot accept control|cannot start the service"
+    r"|the task scheduler service is not running"
+    r"|task scheduler is not running)",
     re.IGNORECASE,
 )
 _ACCESS_DENIED_PATTERN = re.compile(r"(access is denied|acceso denegado)", re.IGNORECASE)
@@ -669,18 +678,16 @@ def _write_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
 def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, str]:
     """Create or replace the Scheduled Task. Returns (success, detail).
 
-    Always recreate instead of ``/Change``. Older Hermes builds and failed
-    experiments may have left repeat/restart settings on the task; ``/Change``
-    preserves those stale triggers and can make the gateway relaunch every
-    minute. Delete+create gives us a clean ONLOGON task every install.
+    Deliberately does NOT pre-delete: ``/Create /F`` replaces the existing
+    task definition in place (the XML fully specifies triggers/settings, so
+    stale triggers from older Hermes builds are overwritten anyway). A
+    pre-delete was destroy-on-failure: when schtasks is broken or the Task
+    Scheduler service is down (observed: service STOPPED since boot, every
+    call returning "ERROR: The network address is invalid"), the old code
+    ran ``/Delete /F`` first and only then attempted ``/Create /F`` — the
+    delete succeeded, the create failed, and install had silently degraded
+    autostart from "working task" to "nothing" (2026-09-01..03 incident).
     """
-    delete_code, delete_out, delete_err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
-    delete_detail = (delete_err or delete_out or "").strip()
-    if delete_code != 0 and delete_detail and "cannot find" not in delete_detail.lower():
-        if _is_access_denied(delete_detail):
-            return (False, f"schtasks /Delete failed (code {delete_code}): {delete_detail}")
-        # Non-fatal: /Create /F below may still replace it. Keep the detail in
-        # the final error if creation also fails.
     user = _resolve_task_user()
     # The Scheduled Task launches the console-less .vbs (issue #45599 fix A), not
     # the .cmd. Immediate manual starts use _spawn_detached().
@@ -703,8 +710,6 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
             xml_path.unlink(missing_ok=True)
         except OSError:
             pass
-    if delete_detail and "cannot find" not in delete_detail.lower():
-        last_err = f"{last_err.strip()} (delete detail: {delete_detail})"
     return (False, f"schtasks /Create failed (code {last_code}): {last_err.strip()}")
 
 

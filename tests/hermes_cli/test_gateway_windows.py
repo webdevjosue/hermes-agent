@@ -267,11 +267,20 @@ def test_elevated_gateway_command_uses_hidden_console_python(monkeypatch):
 
 
 def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_path):
-    """Install must delete+create so stale minute-repeat task settings are not preserved.
+    """Install must fully replace the task definition, never /Change it, and
+    must NOT pre-delete (destroy-on-failure hazard).
 
     Host-agnostic on purpose: ``_install_scheduled_task`` only renders the task
     XML and shells out through ``_exec_schtasks`` (mocked here as the genuine
     external dependency), so no platform fake is needed.
+
+    ``/Create /F /XML`` force-replaces the whole definition in place — stale
+    minute-repeat triggers from older builds are overwritten because the XML
+    fully specifies Triggers/Settings. A preceding ``/Delete /F`` added only
+    risk: when schtasks is broken (e.g. Task Scheduler service down), the
+    delete succeeded and the create failed, leaving NO task where a working
+    one existed before (2026-09-01..03 incident — see
+    test_gateway_windows_scheduler_down.py).
     """
     calls = []
     script_path = tmp_path / "Hermes_Gateway_alice.cmd"
@@ -282,7 +291,7 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     def fake_schtasks(args):
         calls.append(tuple(args))
         if args[0] == "/Delete":
-            return (0, "SUCCESS", "")
+            raise AssertionError("install must not /Delete — /Create /F replaces in place")
         if args[0] == "/Create":
             xml_path = Path(args[args.index("/XML") + 1])
             xml_seen["text"] = xml_path.read_text(encoding="utf-16")
@@ -294,10 +303,9 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
 
     assert ok is True
     assert "/Change" not in [arg for call in calls for arg in call]
-    assert calls[0][:4] == ("/Delete", "/F", "/TN", "Hermes_Gateway_alice")
-    assert calls[1][0] == "/Create"
-    assert "/XML" in calls[1]
-    assert "/SC" not in calls[1]
+    assert calls[0][0] == "/Create"
+    assert "/F" in calls[0]
+    assert "/XML" in calls[0]
     assert "<Delay>PT30S</Delay>" in xml_seen["text"]
     assert "<StartWhenAvailable>true</StartWhenAvailable>" in xml_seen["text"]
     assert "<StopOnIdleEnd>false</StopOnIdleEnd>" in xml_seen["text"]
