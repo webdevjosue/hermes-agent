@@ -390,7 +390,23 @@ def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
     try:
         if _gateway_status.owns_gateway_runtime_lock():
             return None
-        if not _gateway_status.is_gateway_runtime_lock_active():
+        # Probe the lock of the home THIS tick is scoped to, not the process
+        # launch home. Under the desktop/multiplex all-profiles ticker the
+        # per-profile loop scopes the store via set_hermes_home_override,
+        # while _get_process_hermes_home() deliberately ignores that override
+        # (#56986) — consulting it here made the gate read the DEFAULT home's
+        # lock while ticking a secondary profile's store. When a fresh
+        # non-multiplexing gateway held the default lock, the stale desktop
+        # backend yielded every tick for a store no fresh process ticks
+        # (silent no-dispatch dead zone, t_f93c28f1). The yield contract
+        # ("fresh code picks the job up") only holds for the ticked home.
+        lock_path = None
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if override:
+            lock_path = Path(override) / _gateway_status._GATEWAY_LOCK_FILENAME
+        if not _gateway_status.is_gateway_runtime_lock_active(lock_path):
             return None
     except Exception:
         return None

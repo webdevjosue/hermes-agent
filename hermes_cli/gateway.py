@@ -6279,6 +6279,99 @@ def _running_under_gateway_supervisor() -> bool:
     return is_gateway_supervisor_process()
 
 
+def _iter_serve_backend_command_lines():
+    """Yield ``(pid, command_line)`` for live desktop ``serve`` backends.
+
+    The desktop app's backend runs ``hermes_cli.main --profile <name> serve
+    --host 127.0.0.1 --port 0``; its in-process cron ticker is started with
+    ``profiles_to_serve(multiplex=True)`` (web_server.py) so a ``--profile
+    default`` backend ticks EVERY profile's cron store. Liveness surfaces
+    that only look for ``gateway run`` processes miss it entirely
+    (t_f93c28f1).
+
+    Best-effort + cheap: psutil is a hard dependency; any probe failure
+    yields nothing (callers treat that as "no desktop ticker").
+    """
+    try:
+        import psutil
+    except Exception:
+        return
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cmdline = proc.info["cmdline"]
+            except Exception:
+                continue
+            if not cmdline:
+                continue
+            try:
+                command = " ".join(cmdline)
+            except Exception:
+                continue
+            if "hermes_cli.main" not in command:
+                continue
+            if " serve" not in f" {command} ":
+                continue
+            try:
+                pid = proc.info["pid"]
+            except Exception:
+                continue
+            yield (pid, command)
+    except Exception:
+        return
+
+
+def detect_desktop_cron_ticker_for_profile(profile_name: str | None = None) -> tuple[int, str] | None:
+    """Return ``(pid, command_line)`` of a live desktop backend that ticks
+    this profile's cron store, or ``None``.
+
+    Two backend shapes count:
+
+    * ``--profile <this profile> serve`` — a per-profile desktop backend
+      ticks its own store.
+    * ``--profile default serve`` — the pooled primary backend ticks EVERY
+      profile's store (web_server.py starts its ticker with
+      ``profiles_to_serve(multiplex=True)`` unconditionally).
+
+    This is the dispatch trigger the status probes model as "gateway run"
+    only: on multiplex-off fleets (this box) a named profile can have no
+    ``gateway.pid`` of its own while its jobs fire on time from the desktop
+    backend. Reported as running with the backend named — never as a bare
+    "not running" false negative (t_f93c28f1).
+
+    Excludes self and ancestors implicitly (a ``serve`` process is never the
+    CLI process running status). ``gateway run`` processes are NOT matched:
+    they are already covered by the pid-file / lock / scan probes.
+    """
+    try:
+        if profile_name is None:
+            suffix = _profile_suffix()
+            profile_name = suffix if suffix else "default"
+        profile_name = profile_name.lower()
+        for pid, command in _iter_serve_backend_command_lines():
+            command_lc = command.lower()
+            # Defense in depth: only actual ``serve`` invocations count —
+            # never ``gateway run`` (already covered by pid/lock/scan probes).
+            if " serve" not in f" {command_lc} ":
+                continue
+            # Exact "--profile <name> serve" or "-p <name> serve" for this
+            # profile, or the default backend that ticks every store.
+            import re
+
+            m = re.search(r"(?:--profile|-p)\s+([a-z0-9][a-z0-9_-]*)", command_lc)
+            backend_profile = m.group(1) if m else "default"
+            if backend_profile == profile_name or backend_profile == "default":
+                return (pid, command)
+    except Exception:
+        return None
+    return None
+
+
+def _desktop_cron_ticker_hit() -> tuple[int, str] | None:
+    """Memo-safe alias used by status surfaces; see detect_desktop_cron_ticker_for_profile."""
+    return detect_desktop_cron_ticker_for_profile()
+
+
 def named_profile_served_by_running_multiplexer(profile_name: str | None = None) -> bool:
     """True when a live default multiplexer already ticks this named profile.
 
@@ -9081,6 +9174,16 @@ def _gateway_command_inner(args):
             # default multiplexer is the live inbound process for it.
             print("✓ Gateway is running via the default-profile multiplexer")
             print("  Manage it from the default profile: hermes gateway status")
+        elif not snapshot.running and _desktop_cron_ticker_hit() is not None:
+            # Multiplex-off fleet: no gateway.pid for this profile, but the
+            # desktop app's all-profiles cron ticker dispatches its jobs
+            # (t_f93c28f1). Report the real trigger instead of "not running".
+            _pid, _cmd = _desktop_cron_ticker_hit()
+            print(
+                "✗ No gateway process for this profile — cron jobs fire via "
+                f"the desktop app backend (PID {_pid})"
+            )
+            print("  (The desktop backend ticks every profile's cron store.)")
         elif supports_systemd_services() and (
             get_systemd_unit_path(system=False).exists()
             or get_systemd_unit_path(system=True).exists()

@@ -211,6 +211,16 @@ class _LivenessPatches:
                 return_value=self._lock_active,
             )
         )
+        # Pin the desktop-backend detector off so these tests stay
+        # deterministic on machines where the desktop app (and its
+        # all-profiles cron ticker backend) is genuinely running — same
+        # convention as the lock-probe pin above (t_f93c28f1).
+        self._stack.enter_context(
+            patch(
+                "hermes_cli.gateway.detect_desktop_cron_ticker_for_profile",
+                return_value=None,
+            )
+        )
         return self
 
     def __exit__(self, *exc):
@@ -268,6 +278,10 @@ class TestRuntimeLockFirstLiveness:
                 "hermes_cli.gateway.named_profile_served_by_running_multiplexer",
                 return_value=False,
             ),
+            patch(
+                "hermes_cli.gateway.detect_desktop_cron_ticker_for_profile",
+                return_value=None,
+            ),
         ):
             assert cron_cli._builtin_gateway_liveness() is False
 
@@ -319,6 +333,10 @@ class TestRuntimeLockFirstLiveness:
                 "hermes_cli.gateway.named_profile_served_by_running_multiplexer",
                 return_value=False,
             ),
+            patch(
+                "hermes_cli.gateway.detect_desktop_cron_ticker_for_profile",
+                return_value=None,
+            ),
         ):
             assert cron_cli._builtin_gateway_liveness() is False
 
@@ -348,6 +366,12 @@ class TestCronStatusLockFirst:
                 return_value=lock_active,
             ),
             patch("gateway.status.get_running_pid", return_value=lock_pid),
+            # Deterministic on machines where the desktop app's all-profiles
+            # cron ticker backend is genuinely running (t_f93c28f1).
+            patch(
+                "hermes_cli.gateway.detect_desktop_cron_ticker_for_profile",
+                return_value=None,
+            ),
             redirect_stdout(out),
         ):
             cron_cli.cron_status()
