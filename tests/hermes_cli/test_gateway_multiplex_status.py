@@ -35,9 +35,16 @@ def _run_status():
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        gw._gateway_command_inner(
-            SimpleNamespace(gateway_command="status", deep=False, full=False, system=False)
-        )
+        # Deterministic on machines where the desktop app's all-profiles cron
+        # ticker backend is genuinely running (t_f93c28f1).
+        from unittest.mock import patch
+
+        with patch.object(
+            gw, "detect_desktop_cron_ticker_for_profile", return_value=None
+        ):
+            gw._gateway_command_inner(
+                SimpleNamespace(gateway_command="status", deep=False, full=False, system=False)
+            )
     return buf.getvalue().splitlines()[0]
 
 

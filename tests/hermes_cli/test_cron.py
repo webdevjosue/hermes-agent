@@ -306,6 +306,12 @@ class TestGatewayNotRunningWarning:
     def test_list_warns_when_gateway_absent(self, tmp_cron_dir, capsys, monkeypatch):
         create_job(prompt="Daily report", schedule="0 11 * * *")
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        # Deterministic on machines where the desktop app's all-profiles cron
+        # ticker backend is genuinely running (t_f93c28f1).
+        monkeypatch.setattr(
+            "hermes_cli.gateway.detect_desktop_cron_ticker_for_profile",
+            lambda *a, **k: None,
+        )
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
         assert "Gateway is not running" in out
@@ -387,6 +393,12 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     )
     monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
     monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+    # Deterministic on machines where the desktop app's all-profiles cron
+    # ticker backend is genuinely running (t_f93c28f1).
+    monkeypatch.setattr(
+        "hermes_cli.gateway.detect_desktop_cron_ticker_for_profile",
+        lambda *a, **k: None,
+    )
 
     cron_cli.cron_list()
 

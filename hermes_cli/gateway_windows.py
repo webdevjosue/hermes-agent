@@ -1711,7 +1711,25 @@ def status(deep: bool = False) -> None:
     if pids:
         print(f"✓ Gateway process running (PID: {', '.join(map(str, pids))})")
     else:
-        print("✗ No gateway process detected")
+        # No gateway of THIS profile — but on multiplex-off fleets the
+        # desktop app's ``serve`` backend ticks every profile's cron store
+        # (web_server.py profiles_to_serve(multiplex=True)). Say so instead
+        # of a bare false-negative (t_f93c28f1).
+        desktop_hit = None
+        try:
+            from hermes_cli.gateway import detect_desktop_cron_ticker_for_profile
+
+            desktop_hit = detect_desktop_cron_ticker_for_profile()
+        except Exception:
+            desktop_hit = None
+        if desktop_hit is not None:
+            print(
+                f"✗ No gateway process for this profile — cron dispatch runs "
+                f"via the desktop app backend (PID {desktop_hit[0]}), which "
+                f"ticks this profile's cron jobs"
+            )
+        else:
+            print("✗ No gateway process detected")
 
     if deep:
         print()

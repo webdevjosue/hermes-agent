@@ -102,7 +102,38 @@ def _builtin_gateway_liveness() -> Optional[bool]:
             return True
         # Satellite profile: no local gateway.pid, but the default multiplexer
         # ticks this profile's cron store (#97120).
-        return named_profile_served_by_running_multiplexer()
+        if named_profile_served_by_running_multiplexer():
+            return True
+        # Desktop-app backend: its all-profiles cron ticker (web_server.py)
+        # fires this store's jobs even with no gateway.pid anywhere
+        # (multiplex-off fleets — t_f93c28f1).
+        from hermes_cli.gateway import detect_desktop_cron_ticker_for_profile
+
+        if detect_desktop_cron_ticker_for_profile() is not None:
+            return True
+        # All probes ran clean and none found a dispatch trigger: the builtin
+        # ticker's process is genuinely absent.
+        return False
+    except Exception:
+        return None
+
+
+def _desktop_ticker_note() -> str | None:
+    """One-line note naming the live desktop backend ticking this store.
+
+    Shown by ``cron status`` when the profile's own gateway is absent but a
+    desktop ``serve`` backend's all-profiles ticker owns dispatch
+    (t_f93c28f1): without it, "✓ Gateway is running" is indistinguishable
+    from the gateway-run case and users re-check the wrong process.
+    """
+    try:
+        from hermes_cli.gateway import detect_desktop_cron_ticker_for_profile
+
+        hit = detect_desktop_cron_ticker_for_profile()
+        if hit is None:
+            return None
+        pid, _command = hit
+        return f"desktop app backend (PID {pid})"
     except Exception:
         return None
 
@@ -594,12 +625,40 @@ def cron_status():
             if hb_age is not None:
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:
-        print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
-        print()
-        print("  To enable automatic execution:")
-        print("    hermes gateway install    # Install as a user service")
-        print("    sudo hermes gateway install --system  # Linux servers: boot-time system service")
-        print("    hermes gateway            # Or run in foreground")
+        # No own gateway process — but the desktop app's all-profiles ticker
+        # may own dispatch for this store (multiplex-off fleets fire named
+        # profiles' jobs from the ``serve`` backend, t_f93c28f1). Never a
+        # bare "not running" when that backend is live.
+        desktop_note = _desktop_ticker_note()
+        if desktop_note:
+            print(color(
+                "✓ Cron dispatch is alive — jobs fire via the desktop app's "
+                "all-profiles ticker",
+                Colors.GREEN,
+            ))
+            print(f"  Trigger: {desktop_note} (no gateway.pid for this profile)")
+            print("  This profile has no gateway of its own; its jobs are dispatched")
+            print("  by the desktop backend. Open the desktop app to keep them firing.")
+            from cron.jobs import get_ticker_heartbeat_age, get_ticker_success_age
+
+            hb_age = get_ticker_heartbeat_age()
+            ok_age = get_ticker_success_age()
+            if hb_age is not None:
+                print(f"  Ticker heartbeat: {int(hb_age)}s ago")
+            if ok_age is not None and ok_age > 200:
+                print(color(
+                    f"  ⚠ No successful tick in {int(ok_age)}s — ticks may be "
+                    "yielding or failing; check `ticker_last_error` in this "
+                    "profile's cron/ directory.",
+                    Colors.YELLOW,
+                ))
+        else:
+            print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
+            print()
+            print("  To enable automatic execution:")
+            print("    hermes gateway install    # Install as a user service")
+            print("    sudo hermes gateway install --system  # Linux servers: boot-time system service")
+            print("    hermes gateway            # Or run in foreground")
 
     print()
 
