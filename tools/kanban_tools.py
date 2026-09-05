@@ -2172,11 +2172,15 @@ KANBAN_BLOCK_SCHEMA = {
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
+        "needed; refused when every parent is already done), 'needs_input' "
+        "(you need a human decision/answer), 'capability' (a hard wall: no "
+        "access, missing credentials, an action no agent can do), or "
+        "'transient' (a flaky failure that may clear). To park a task until "
+        "a TIME (verification window, gate, quiet hours), do NOT use this "
+        "tool — run `hermes kanban schedule <task_id> <reason>` instead: it "
+        "parks the card in one atomic write that no dispatcher tick can "
+        "interrupt. ``reason`` is shown to the human on the board. If a task "
+        "keeps getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
@@ -2200,8 +2204,10 @@ KANBAN_BLOCK_SCHEMA = {
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "resumes automatically (requires at least one parent "
+                    "still open); the others surface to a human. Omit only "
+                    "if none apply. For a time-gated park use `hermes "
+                    "kanban schedule` instead of this tool."
                 ),
             },
             "board": _board_schema_prop(),

@@ -3579,6 +3579,33 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if initial_status == "blocked":
+                    # Park-on-create must be STICKY: emit the ``blocked``
+                    # event the sticky predicate (``_has_sticky_block``)
+                    # looks for, so ``recompute_ready`` never auto-promotes
+                    # a card the creator explicitly parked for a human
+                    # (board defect t_849eeac9 / t_fdf58966 run 314: a
+                    # created-blocked "Human: restart the desktop app" card
+                    # was promoted + spawned 34s after creation because its
+                    # parent had just completed and no ``blocked`` event
+                    # existed to mark the park deliberate). Without this,
+                    # ``initial_status="blocked"`` differs from
+                    # ``block_task`` only by an invisible signal, and the
+                    # only exit is the same: an explicit ``unblock_task``.
+                    # Note the swarm root (``kanban_swarm``) also creates
+                    # blocked and is flipped to ``done`` inside the same
+                    # outer txn before any tick can observe it, so the
+                    # extra event is inert there.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "kind": None,
+                            "reason": "initial_status=blocked at creation",
+                            "origin": "create_task",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -6524,6 +6551,34 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # Dependency blocks park in ``todo`` waiting for PARENTS — but
+            # when every parent is already terminal there is nothing to wait
+            # for and the park is instantly promotable: the next dispatcher
+            # tick's ``recompute_ready`` promotes, claims and spawns a
+            # worker while the caller's follow-up park write (e.g.
+            # ``hermes kanban schedule``) is still in flight, orphaning the
+            # spawned run (board defect t_849eeac9 / t_9727da9a run 311:
+            # dependency_wait 04:20:58 -> promoted+claimed run 311
+            # 04:21:22 -> scheduled 04:22:26). Refuse and point at the
+            # atomic single-write park instead.
+            parents_done = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if parents_done is None:
+                raise ValueError(
+                    f"cannot block {task_id} with kind='dependency': every "
+                    f"parent is already done/archived, so a dependency park "
+                    f"in 'todo' is instantly promotable (t_849eeac9 park "
+                    f"race). For a time-gated park use the single atomic "
+                    f"write instead: `hermes kanban schedule {task_id} "
+                    f"<reason>` from running (schedule_task), which no "
+                    f"dispatcher tick can interrupt. For a human-input park "
+                    f"use kind='needs_input'."
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
