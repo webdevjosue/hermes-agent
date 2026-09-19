@@ -55,20 +55,10 @@ def _needs_windows_de_elevation_guard() -> bool:
         return False
     try:
         import ctypes
-        token = ctypes.c_ulong()
-        curr = ctypes.windll.kernel32.GetCurrentProcess()
-        if not ctypes.windll.advapi32.OpenProcessToken(curr, 0x0008, ctypes.byref(token)):
-            return False
-        try:
-            info = ctypes.c_ulong()
-            ret_len = ctypes.c_ulong()
-            # TokenElevation class = 20; fail-closed (no guard) when the query is unavailable
-            if ctypes.windll.advapi32.GetTokenInformation(token, 20, ctypes.byref(info), 4,
-                                                          ctypes.byref(ret_len)) == 0:
-                return False
-            return bool(info.value)
-        finally:
-            ctypes.windll.kernel32.CloseHandle(token)
+        # IsUserAnAdmin is the shell's own elevation verdict (equivalent to the token-groups
+        # check net session performs); a manual OpenProcessToken dance is easy to get wrong
+        # (GetCurrentProcess pseudo-handle truncation → ERROR_INVALID_HANDLE) and adds nothing.
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
