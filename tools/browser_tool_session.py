@@ -64,6 +64,7 @@ def _needs_windows_de_elevation_guard() -> bool:
 
 
 _DE_ELEVATION_GUARD_FLAG = "--do-not-de-elevate"
+_de_elevation_guard_warned = False
 
 
 def _merge_browser_launch_args(browser_env: Dict[str, str], flag: str) -> None:
@@ -85,7 +86,14 @@ def _apply_chromium_sandbox_args(browser_env: Dict[str, str]) -> None:
     # Windows elevation guard composes with (or substitutes for) the sandbox set: chrome's
     # de-elevation handoff kills the auto-launched browser even when sandboxing is fine.
     if _needs_windows_de_elevation_guard():
-        _bt.logger.debug("browser: elevated Windows process — injecting %s", _DE_ELEVATION_GUARD_FLAG)
+        global _de_elevation_guard_warned
+        if not _de_elevation_guard_warned:
+            _de_elevation_guard_warned = True
+            _bt.logger.warning(
+                "browser: Windows de-elevation guard ACTIVE (process is elevated; "
+                "injecting %s so chrome does not exit 0 via the de-elevation broker "
+                "— leaked chrome trees from failed client auto-launches are swept "
+                "by the janitor)", _DE_ELEVATION_GUARD_FLAG)
         _merge_browser_launch_args(browser_env, _DE_ELEVATION_GUARD_FLAG)
 
 

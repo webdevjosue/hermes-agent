@@ -588,6 +588,126 @@ class TestLeakedDaemonWithLiveOwner:
         assert d.exists()
 
 
+class _FakeProc:
+    """Minimal psutil.Process stand-in for profile-sweep tests."""
+
+    def __init__(self, pid, name, cmdline, parent=None):
+        self.pid = pid
+        self._name = name
+        self._cmdline = cmdline
+        self._parent = parent
+
+    def name(self):
+        return self._name
+
+    def cmdline(self):
+        return self._cmdline
+
+    def parent(self):
+        if self._parent is None:
+            return None
+        try:
+            self._parent.pid  # surface early death as NoSuchProcess-ish failure
+        except Exception:
+            return None
+        return self._parent
+
+
+class TestLeakedChromeProfileSweep:
+    """The ``agent-browser-chrome-<uuid>`` temp profile dir janitor (t_7ebe0c09).
+
+    Failed client-side auto-launches (elevated Windows chrome de-elevation) leave
+    a chrome tree + profile dir owned by NO agent-browser daemon; the socket-dir
+    reaper never sees them. The sweep maps live chrome ``--user-data-dir`` args
+    to these dirs and reaps ownerless trees, and removes idle ownerless dirs.
+    """
+
+    def _make_profile_dir(self, tmpdir, uuid="deadbeef-0000-0000-0000-000000000000"):
+        d = tmpdir / f"agent-browser-chrome-{uuid}"
+        d.mkdir()
+        (d / "DevToolsActivePort").write_text("9222\n")
+        return d
+
+    def test_dead_profile_dir_past_grace_is_removed(self, fake_tmpdir):
+        from tools.browser_tool import BROWSER_ORPHAN_GRACE_SECONDS
+        from tools.browser_tool_lifecycle import _sweep_leaked_chrome_profiles
+
+        d = self._make_profile_dir(fake_tmpdir)
+        _age_socket_dir(d, BROWSER_ORPHAN_GRACE_SECONDS + 600)
+        with patch("tools.browser_tool_lifecycle._live_chrome_processes_by_profile_dir",
+                   return_value={}):
+            removed = _sweep_leaked_chrome_profiles()
+
+        assert removed == 1
+        assert not d.exists()
+
+    def test_fresh_dead_profile_dir_survives_creator_race(self, fake_tmpdir):
+        from tools.browser_tool_lifecycle import _sweep_leaked_chrome_profiles
+
+        d = self._make_profile_dir(fake_tmpdir)
+        with patch("tools.browser_tool_lifecycle._live_chrome_processes_by_profile_dir",
+                   return_value={}):
+            removed = _sweep_leaked_chrome_profiles()
+
+        assert removed == 0
+        assert d.exists()
+
+    def _norm_key(self, d):
+        import os
+        return os.path.normcase(os.path.normpath(str(d)))
+
+    def test_ownerless_live_tree_is_killed_and_dir_removed(self, fake_tmpdir):
+        """A live chrome tree with no agent-browser ancestor is a leaked straggler."""
+        from tools.browser_tool_lifecycle import _sweep_leaked_chrome_profiles
+
+        d = self._make_profile_dir(fake_tmpdir)
+        dir_arg = f"--user-data-dir={d}"
+        root = _FakeProc(111, "chrome.exe", ["chrome.exe", dir_arg])
+        child = _FakeProc(222, "chrome.exe", ["chrome.exe", "--type=renderer", dir_arg],
+                          parent=root)
+        with patch("tools.browser_tool_lifecycle._live_chrome_processes_by_profile_dir",
+                   return_value={self._norm_key(d): [111, 222]}), \
+             patch("psutil.Process", side_effect=lambda pid: {111: root, 222: child}[pid]), \
+             patch("agent.deadline.kill_process_tree") as kill_tree, \
+             patch("time.sleep"):
+            removed = _sweep_leaked_chrome_profiles()
+
+        assert removed == 1
+        assert not d.exists()
+        assert kill_tree.call_count >= 1
+        assert kill_tree.call_args_list[0].args[0] == 111  # tree root, not the renderer
+
+    def test_daemon_owned_live_tree_is_spared(self, fake_tmpdir):
+        """Live tree with an agent-browser ancestor is a healthy daemon browser."""
+        from tools.browser_tool_lifecycle import _sweep_leaked_chrome_profiles
+
+        d = self._make_profile_dir(fake_tmpdir)
+        dir_arg = f"--user-data-dir={d}"
+        daemon = _FakeProc(333, "agent-browser.exe", ["agent-browser", "serve"])
+        root = _FakeProc(111, "chrome.exe", ["chrome.exe", dir_arg], parent=daemon)
+        with patch("tools.browser_tool_lifecycle._live_chrome_processes_by_profile_dir",
+                   return_value={self._norm_key(d): [111]}), \
+             patch("psutil.Process", side_effect=lambda pid: {111: root}[pid]), \
+             patch("agent.deadline.kill_process_tree") as kill_tree:
+            removed = _sweep_leaked_chrome_profiles()
+
+        assert removed == 0
+        assert d.exists()
+        kill_tree.assert_not_called()
+
+    def test_reaper_invokes_profile_sweep(self, fake_tmpdir):
+        """_reap_orphaned_browser_sessions must also sweep leaked chrome profiles."""
+        from tools.browser_tool_lifecycle import _reap_orphaned_browser_sessions
+
+        sweep_calls = []
+        with patch("tools.browser_tool_lifecycle._sweep_leaked_chrome_profiles",
+                   side_effect=lambda: sweep_calls.append(True)) as sweep:
+            _reap_orphaned_browser_sessions()
+
+        sweep.assert_called_once()
+        assert sweep_calls
+
+
 class TestPeriodicOrphanReap:
     """The reaper must run repeatedly, not only at cleanup-thread startup.
 

@@ -350,11 +350,173 @@ def _reap_socket_dir(socket_dir: str, session_name: str, tracked_names: set) -> 
     return reaped
 
 
+_CHROME_PROFILE_DIR_PREFIX = "agent-browser-chrome-"
+
+
+def _chrome_profile_dir_idle_seconds(profile_dir: str) -> Optional[float]:
+    """Seconds since ``profile_dir`` was last written; None when unreadable (fail safe)."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(profile_dir))
+    except OSError:
+        return None
+
+
+def _live_chrome_processes_by_profile_dir() -> Dict[str, list]:
+    """Map normalized ``--user-data-dir`` value -> live chrome-ish PIDs.
+
+    Covers chrome/chromium/msedge binaries (agent-browser can drive any of them).
+    A missing/short cmdline (access denied) contributes nothing — fail safe.
+    """
+    import psutil
+
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path.strip().strip('"')))
+
+    mapping: Dict[str, list] = {}
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            if not any(marker in name for marker in ("chrome", "chromium", "msedge")):
+                continue
+            cmdline = proc.info.get("cmdline") or []
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+        for i, arg in enumerate(cmdline):
+            if not arg or not arg.startswith("--user-data-dir"):
+                continue
+            value = arg.split("=", 1)[1] if "=" in arg else (
+                cmdline[i + 1] if i + 1 < len(cmdline) else "")
+            if value:
+                mapping.setdefault(_norm(value), []).append(proc.pid)
+    return mapping
+
+
+def _has_live_agent_browser_owner(proc: "psutil.Process") -> bool:
+    """True when any ancestor of ``proc`` is an agent-browser process (daemon-owned
+    chrome tree = healthy, never swept). Stops at 16 hops (cycle defense).
+
+    The substring match cannot run over the raw cmdline: every chrome in an
+    ``agent-browser-chrome-*`` profile carries "agent-browser" inside its own
+    ``--user-data-dir`` value, which would spare every leaked tree. Args that
+    merely reference the temp profile dir are stripped before matching.
+    """
+    import psutil
+
+    current = proc
+    for _ in range(16):
+        try:
+            current = current.parent()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+        if current is None:
+            return False
+        try:
+            name = (current.name() or "").lower()
+            if "agent-browser" in name:
+                return True
+            argv = current.cmdline() or []
+            # Strip args that reference OUR temp profile dir naming — the leaked
+            # dir name itself contains "agent-browser" (false-positive source).
+            argv = [a for a in argv if _CHROME_PROFILE_DIR_PREFIX not in a]
+            if any("agent-browser" in a.lower() for a in argv):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+    return False
+
+
+def _sweep_leaked_chrome_profiles() -> int:
+    """Reap ``agent-browser-chrome-<uuid>`` temp profile dirs leaked by failed
+    client-side auto-launches (t_7ebe0c09: elevated-parent chrome de-elevates, the
+    launcher's probe exits 0, and the surviving grandchild tree + its profile dir
+    are owned by no agent-browser daemon and reaped by nobody).
+
+    Per dir: a live chrome tree bound to it with NO agent-browser ancestor is a
+    leaked straggler — tree-kill then rmtree. A tree WITH an ancestor is a healthy
+    daemon-owned browser: skip. No live process + idle past
+    ``BROWSER_ORPHAN_GRACE_SECONDS``: leaked dir, rmtree. Fresh process-less dirs
+    stay (creator race). PIDs are identity-verified (chrome-ish name AND the profile
+    dir on their cmdline) before any kill. Returns the number of dirs removed.
+    """
+    import glob
+
+    import psutil
+
+    profile_dirs = glob.glob(os.path.join(_bt._socket_safe_tmpdir(),
+                                          f"{_CHROME_PROFILE_DIR_PREFIX}*"))
+    if not profile_dirs:
+        return 0
+
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path))
+
+    live_by_dir = _live_chrome_processes_by_profile_dir()
+    removed = 0
+    for profile_dir in profile_dirs:
+        if not os.path.isdir(profile_dir):
+            continue
+        pids = live_by_dir.get(_norm(profile_dir), [])
+        if pids:
+            # Verify every claimed PID before killing: chrome-ish name AND bound to
+            # this dir (the cmdline match built the map, but re-check at kill time).
+            roots = []
+            for pid in pids:
+                try:
+                    proc = psutil.Process(pid)
+                    name = (proc.name() or "").lower()
+                    cmdline = " ".join(proc.cmdline() or [])
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    continue
+                if not any(marker in name for marker in ("chrome", "chromium", "msedge")):
+                    continue
+                if _norm(profile_dir) not in _norm(cmdline):
+                    continue
+                if _has_live_agent_browser_owner(proc):
+                    # Healthy daemon-owned browser using this profile — not a leak.
+                    roots = []
+                    break
+                try:
+                    parent = proc.parent()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    parent = None
+                if parent is None or parent.pid not in pids:
+                    roots.append(proc)
+            if not roots:
+                continue  # healthy tree, or every PID vanished/re-verified away
+            _bt.logger.warning(
+                "Sweeping leaked chrome tree (agent-browser auto-launch straggler): "
+                "%d root(s) on %s", len(roots), profile_dir)
+            from agent import deadline as _deadline
+            for root in roots:
+                try:
+                    _deadline.kill_process_tree(root.pid)
+                except (ProcessLookupError, PermissionError, OSError) as e:
+                    _bt.logger.debug("Leaked-chrome tree kill failed for PID %s: %s", root.pid, e)
+            time.sleep(1.0)  # let handles close before rmtree (Windows)
+        else:
+            idle_s = _chrome_profile_dir_idle_seconds(profile_dir)
+            if idle_s is None or idle_s < _bt.BROWSER_ORPHAN_GRACE_SECONDS:
+                continue  # unknown age or fresh — creator race, fail safe
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        if not os.path.exists(profile_dir):
+            removed += 1
+            _bt.logger.info("Removed leaked chrome profile dir %s", profile_dir)
+        else:
+            _bt.logger.debug("Could not remove leaked chrome profile dir %s (locked?)", profile_dir)
+    if removed:
+        _bt.logger.info("Chrome-profile leak sweep removed %d dir(s)", removed)
+    return removed
+
+
 def _reap_orphaned_browser_sessions():
     """Kill agent-browser daemons whose owning hermes process is gone (an unclean exit loses
     ``_active_sessions`` but node + Chromium keep running). Scans the tmp dir for
     ``agent-browser-*`` socket dirs; safe from any context."""
     import glob
+
+    # Chrome temp profile dirs leaked by failed client auto-launches (no daemon,
+    # no socket dir — the socket reaper below never sees them).
+    _best_effort("Leaked chrome profile sweep", _sweep_leaked_chrome_profiles)
 
     # Lightpanda servers keep their own records (no socket dir); sweep them with the
     # same owner-liveness rule BEFORE the daemon scan, which may return early.
