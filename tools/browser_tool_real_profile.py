@@ -119,6 +119,9 @@ _REAL_PROFILE_CHROME_FLAGS = (
     "--disable-background-networking", "--disable-component-update", "--disable-default-apps",
     "--disable-hang-monitor", "--disable-popup-blocking", "--disable-prompt-on-repost",
     "--disable-sync", "--disable-features=Translate", "--no-startup-window",
+    # Elevated-parent guard: without this chrome.exe de-elevates (relaunch as normal user,
+    # exit 0 before DevToolsActivePort) whenever Hermes itself runs elevated on Windows.
+    "--do-not-de-elevate",
 )
 
 

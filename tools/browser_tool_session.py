@@ -44,12 +44,59 @@ def _needs_chromium_sandbox_bypass() -> bool:
         return False
 
 
+def _needs_windows_de_elevation_guard() -> bool:
+    """True on Windows when this process runs elevated (admin) — chrome.exe then DE-ELEVATES
+    itself (relaunches as the normal user via the OS broker and exits 0 immediately) unless
+    launched with ``--do-not-de-elevate``. agent-browser's client-side auto-launcher spawns a
+    minimal-argv Chrome WITHOUT that flag, so an elevated Hermes reports
+    "Chrome exited early (exit code: 0) without writing DevToolsActivePort" while the
+    de-elevated grandchild keeps booting headlessly (t_e78619bf root cause on 2026-09-18)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        token = ctypes.c_ulong()
+        curr = ctypes.windll.kernel32.GetCurrentProcess()
+        if not ctypes.windll.advapi32.OpenProcessToken(curr, 0x0008, ctypes.byref(token)):
+            return False
+        try:
+            info = ctypes.c_ulong()
+            ret_len = ctypes.c_ulong()
+            # TokenElevation class = 20; fail-closed (no guard) when the query is unavailable
+            if ctypes.windll.advapi32.GetTokenInformation(token, 20, ctypes.byref(info), 4,
+                                                          ctypes.byref(ret_len)) == 0:
+                return False
+            return bool(info.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(token)
+    except Exception:
+        return False
+
+
+_DE_ELEVATION_GUARD_FLAG = "--do-not-de-elevate"
+
+
+def _merge_browser_launch_args(browser_env: Dict[str, str], flag: str) -> None:
+    """Append ``flag`` to AGENT_BROWSER_ARGS without clobbering user-set args (comma-joined;
+    agent-browser accepts comma or newline separated launch args)."""
+    current = browser_env.get("AGENT_BROWSER_ARGS", "")
+    parts = [p.strip() for p in current.split(",") if p.strip()]
+    if flag not in parts:
+        parts.append(flag)
+    browser_env["AGENT_BROWSER_ARGS"] = ",".join(parts)
+
+
 def _apply_chromium_sandbox_args(browser_env: Dict[str, str]) -> None:
-    """Add required Chromium sandbox flags without overriding user settings."""
-    if ("AGENT_BROWSER_ARGS" not in browser_env and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env
-            and _needs_chromium_sandbox_bypass()):
-        _bt.logger.debug("browser: sandbox bypass needed (root/docker/AppArmor userns) — injecting --no-sandbox")
-        browser_env["AGENT_BROWSER_ARGS"] = "--no-sandbox,--disable-dev-shm-usage"
+    """Add required Chromium launch flags without overriding user settings."""
+    if "AGENT_BROWSER_ARGS" not in browser_env and "AGENT_BROWSER_CHROME_FLAGS" not in browser_env:
+        if _needs_chromium_sandbox_bypass():
+            _bt.logger.debug("browser: sandbox bypass needed (root/docker/AppArmor userns) — injecting --no-sandbox")
+            browser_env["AGENT_BROWSER_ARGS"] = "--no-sandbox,--disable-dev-shm-usage"
+    # Windows elevation guard composes with (or substitutes for) the sandbox set: chrome's
+    # de-elevation handoff kills the auto-launched browser even when sandboxing is fine.
+    if _needs_windows_de_elevation_guard():
+        _bt.logger.debug("browser: elevated Windows process — injecting %s", _DE_ELEVATION_GUARD_FLAG)
+        _merge_browser_launch_args(browser_env, _DE_ELEVATION_GUARD_FLAG)
 
 
 def _read_command_output_files(stdout_path: str, stderr_path: str) -> tuple[str, str]:

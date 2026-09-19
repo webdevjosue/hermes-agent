@@ -62,6 +62,51 @@ class TestSandboxBypass:
         assert bt_session._needs_chromium_sandbox_bypass() is True
 
 
+class TestWindowsDeElevationGuard:
+    """Regression (t_e78619bf, 2026-09-18): an elevated Windows Hermes must inject
+    --do-not-de-elevate into AGENT_BROWSER_ARGS — chrome.exe's de-elevation handoff
+    otherwise exits 0 before writing DevToolsActivePort and every browser_exec fails
+    with "Chrome exited early (exit code: 0)"."""
+
+    def test_guard_detected_when_elevated(self, monkeypatch):
+        monkeypatch.setattr(bt_session.os, "name", "nt")
+        monkeypatch.setattr(bt_session, "_needs_windows_de_elevation_guard", lambda: True)
+        env: dict = {}
+        bt_session._apply_chromium_sandbox_args(env)
+        assert env.get("AGENT_BROWSER_ARGS") == "--do-not-de-elevate"
+
+    def test_no_injection_when_not_elevated(self, monkeypatch):
+        monkeypatch.setattr(bt_session, "_needs_windows_de_elevation_guard", lambda: False)
+        monkeypatch.setattr(bt_session, "_needs_chromium_sandbox_bypass", lambda: False)
+        env: dict = {}
+        bt_session._apply_chromium_sandbox_args(env)
+        assert "AGENT_BROWSER_ARGS" not in env
+
+    def test_injection_composes_with_user_args(self, monkeypatch):
+        monkeypatch.setattr(bt_session, "_needs_windows_de_elevation_guard", lambda: True)
+        env = {"AGENT_BROWSER_ARGS": "--user-supplied-flag"}
+        bt_session._apply_chromium_sandbox_args(env)
+        assert env["AGENT_BROWSER_ARGS"] == "--user-supplied-flag,--do-not-de-elevate"
+
+    def test_injection_composes_with_sandbox_bypass(self, monkeypatch):
+        monkeypatch.setattr(bt_session, "_needs_windows_de_elevation_guard", lambda: True)
+        monkeypatch.setattr(bt_session, "_needs_chromium_sandbox_bypass", lambda: True)
+        env: dict = {}
+        bt_session._apply_chromium_sandbox_args(env)
+        assert env["AGENT_BROWSER_ARGS"] == "--no-sandbox,--disable-dev-shm-usage,--do-not-de-elevate"
+
+    def test_no_duplicate_on_reapply(self, monkeypatch):
+        monkeypatch.setattr(bt_session, "_needs_windows_de_elevation_guard", lambda: True)
+        env: dict = {}
+        bt_session._apply_chromium_sandbox_args(env)
+        bt_session._apply_chromium_sandbox_args(env)
+        assert env["AGENT_BROWSER_ARGS"].count("--do-not-de-elevate") == 1
+
+    def test_real_profile_flags_carry_guard(self):
+        from tools.browser_tool_real_profile import _REAL_PROFILE_CHROME_FLAGS
+        assert "--do-not-de-elevate" in _REAL_PROFILE_CHROME_FLAGS
+
+
 class TestTimeoutErrorFormatting:
     def test_includes_stderr_detail(self):
         err = bt_session._format_browser_timeout_error(
