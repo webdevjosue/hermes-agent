@@ -395,10 +395,12 @@ def _has_live_agent_browser_owner(proc: "psutil.Process") -> bool:
     """True when any ancestor of ``proc`` is an agent-browser process (daemon-owned
     chrome tree = healthy, never swept). Stops at 16 hops (cycle defense).
 
-    The substring match cannot run over the raw cmdline: every chrome in an
-    ``agent-browser-chrome-*`` profile carries "agent-browser" inside its own
-    ``--user-data-dir`` value, which would spare every leaked tree. Args that
-    merely reference the temp profile dir are stripped before matching.
+    NAME-only match: the cmdline cannot be substring-matched for this decision —
+    bundled Chrome runs from ``~/.agent-browser/browsers/...`` (argv[0] contains
+    "agent-browser") and every chrome in a temp profile carries the dir name in
+    ``--user-data-dir``/``--database`` args, so a cmdline match would spare every
+    leaked tree. The daemon binary is ``agent-browser[-win32-x64].exe``; chrome
+    never carries that name. An unreadable ancestor chain fails safe (spare).
     """
     import psutil
 
@@ -411,14 +413,7 @@ def _has_live_agent_browser_owner(proc: "psutil.Process") -> bool:
         if current is None:
             return False
         try:
-            name = (current.name() or "").lower()
-            if "agent-browser" in name:
-                return True
-            argv = current.cmdline() or []
-            # Strip args that reference OUR temp profile dir naming — the leaked
-            # dir name itself contains "agent-browser" (false-positive source).
-            argv = [a for a in argv if _CHROME_PROFILE_DIR_PREFIX not in a]
-            if any("agent-browser" in a.lower() for a in argv):
+            if "agent-browser" in (current.name() or "").lower():
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             return False
