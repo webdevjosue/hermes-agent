@@ -102,7 +102,15 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. "
+        "LOOP-CLOSURE LAW: the summary MUST end with a 2-3 line "
+        "execution trace — 'attempted: ... / failed: ... / verified: "
+        "... / do-differently: ...' — or an explicit trace object in "
+        "``metadata`` (keys like loop_closure_trace / execution_trace "
+        "with all four fields), or the explicit line "
+        "'loop-closure: nothing new' when the run genuinely taught "
+        "nothing. Trace-less completions are rejected (enforced for "
+        "the orchestrator + frontend + designer profiles)."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),

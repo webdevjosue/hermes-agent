@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -281,6 +282,106 @@ def _require_orchestrator_tool(tool_name: str) -> None:
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers must use "
             "kanban_complete, kanban_request_review, kanban_request_changes, kanban_block, "
             "kanban_heartbeat, or kanban_comment for their assigned task.")
+
+
+# Profiles whose kanban_complete summaries MUST carry an explicit
+# loop-closure trace.  Fleet Loop Digest 2026-08-31 Week 1 found 0/15
+# audited done cards with the trace despite the LOOP-CLOSURE LAW text
+# shipping in every SOUL.md / system prompt — awareness alone does not
+# enforce behaviour, so the completion path hard-gates it.  Card
+# t_31b252aa scoped this to the orchestrator; t_a617051b added
+# 'frontend' as pilot #2; card t_f431ca9b adds 'designer' as pilot #3
+# after two consecutive audit windows (2026-09-30, t_c4f595ac comment
+# 731: 2/3, t_030fd9d5 traceless; t_33815288 comment 771: 2/3,
+# t_8ad00ee9 traceless) each showed >=1 traceless designer completion.
+_LOOP_TRACE_REQUIRED_PROFILES = frozenset({"default", "frontend", "designer"})
+
+# A summary passes when it contains the explicit nothing-new escape
+# hatch or all four trace concepts (attempted / failed / verified /
+# do-differently, hyphen/space/underscore separator variants and the
+# audit-truncated "verif..." form included — see the window-2 audit's
+# do_differently false-negative, t_33815288).  The check is textual on
+# each SOURCE text independently (summary, legacy result, or the
+# metadata JSON blob): all four concepts must appear within ONE source
+# to count, so rich-but-traceless metadata never passes the gate.
+_LOOP_TRACE_NOTHING_NEW = "loop-closure: nothing new"
+# Concepts in NORMALIZED form (separators folded to single spaces) so the
+# comparison against re.sub(r"[-_\s]+", " ", text) is form-agnostic:
+# "do-differently", "do_differently" and "do differently" all match.
+_LOOP_TRACE_CONCEPTS = (
+    "attempted",
+    "failed",
+    "verified",
+    "do differently",
+)
+
+
+def _active_profile() -> str:
+    """Best-effort acting-profile name (env first, config fallback)."""
+    name = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if name:
+        return name
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _loop_trace_sources(summary, result, metadata) -> list:
+    """Independent text sources a trace may live in."""
+    sources = [str(summary or ""), str(result or "")]
+    if metadata is not None:
+        try:
+            sources.append(json.dumps(metadata, ensure_ascii=False, default=str))
+        except Exception:
+            pass
+    return sources
+
+
+def _missing_loop_concepts(text: str) -> list:
+    """Concepts (of the four) that ``text`` lacks.  Separator forms
+    (-, _, space) are equivalent: the window audits found "do-differently"
+    prose, "do_differently" JSON keys, and audit-truncated "verif..."
+    fragments in the wild."""
+    if not text:
+        return list(_LOOP_TRACE_CONCEPTS)
+    if _LOOP_TRACE_NOTHING_NEW in text.lower():
+        return []
+    normalized = re.sub(r"[-_\s]+", " ", text.lower())
+    return [c for c in _LOOP_TRACE_CONCEPTS if c not in normalized]
+
+
+def _missing_loop_trace(summary, result=None, metadata=None) -> Optional[str]:
+    """Return a rejection message when a required trace is absent.
+
+    Applies only to profiles listed in ``_LOOP_TRACE_REQUIRED_PROFILES``
+    (orchestrator + frontend + designer pilots).  The check is purely
+    textual on the summary / legacy result / metadata blob, runs BEFORE
+    any DB mutation, and returns a retryable tool_error — the task stays
+    in-flight so the worker can simply re-call kanban_complete with the
+    trace appended.
+    """
+    if _active_profile() not in _LOOP_TRACE_REQUIRED_PROFILES:
+        return None
+    sources = _loop_trace_sources(summary, result, metadata)
+    if any(not _missing_loop_concepts(s) for s in sources):
+        return None
+    missing = _missing_loop_concepts(sources[0]) or list(_LOOP_TRACE_CONCEPTS)
+    # Human-facing form: concepts are matched normalized ("do differently")
+    # but the law text every profile sees spells it "do-differently".
+    missing_labels = [m.replace("do differently", "do-differently") for m in missing]
+    return (
+        "kanban_complete blocked by LOOP-CLOSURE LAW gate: summary "
+        f"lacks the execution trace (missing: {', '.join(missing_labels)}). "
+        "Append 2-3 lines to the summary in the form "
+        "'attempted: ... / failed: ... / verified: ... / "
+        "do-differently: ...', or put an explicit trace object under "
+        "metadata keys like loop_closure_trace / execution_trace (all "
+        "four fields), or state 'loop-closure: nothing new' if the run "
+        "genuinely produced no lesson. Task is still in-flight — retry "
+        "kanban_complete with the same handoff plus the trace."
+    )
 
 
 @contextmanager
@@ -702,6 +803,12 @@ def _handle_complete(args: dict, **kw) -> str:
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
     _check(summary or result, "provide at least one of: summary (preferred), result")
+    # LOOP-CLOSURE LAW gate (cards t_31b252aa + t_a617051b + t_f431ca9b): scoped to
+    # the orchestrator + frontend + designer pilots — reject trace-less completion
+    # summaries BEFORE any DB mutation so the worker can retry cheaply.
+    loop_trace_err = _missing_loop_trace(summary, result, metadata)
+    if loop_trace_err:
+        raise _Reject(loop_trace_err)
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
